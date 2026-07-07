@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CupCut Studio</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+</head>
+<body>
+
+<!-- ======================= TOP BAR ======================= -->
+<header id="topbar">
+  <div class="logo">🎬 <b>CupCut</b><span>Studio</span></div>
+  <nav class="mode-tabs">
+    <button id="tab-studio" class="mode-tab active">Studio</button>
+    <button id="tab-tools" class="mode-tab">Tools</button>
+  </nav>
+  <div class="topbar-right">
+    <select id="proj-res" title="Project resolution">
+      <option value="1280x720">720p · 1280×720</option>
+      <option value="1920x1080" selected>1080p · 1920×1080</option>
+      <option value="1080x1920">Vertical · 1080×1920</option>
+      <option value="720x1280">Vertical · 720×1280</option>
+      <option value="1080x1080">Square · 1080×1080</option>
+      <option value="854x480">480p · 854×480</option>
+    </select>
+    <select id="proj-fps" title="Frame rate">
+      <option value="24">24 fps</option>
+      <option value="30" selected>30 fps</option>
+      <option value="60">60 fps</option>
+    </select>
+    <button id="btn-export" class="btn-accent">⬆ Export</button>
+  </div>
+</header>
+
+<!-- ======================= STUDIO ======================= -->
+<main id="studio">
+  <div class="studio-top">
+
+    <aside id="library">
+      <div class="panel-head">
+        <span>Media</span>
+        <button id="btn-import" class="btn-small">＋ Import</button>
+        <input type="file" id="file-input" multiple
+               accept="video/*,audio/*,image/*" hidden>
+      </div>
+      <div id="asset-list" class="asset-list">
+        <div class="lib-empty" id="lib-empty">
+          <div class="lib-empty-icon">📂</div>
+          Drop video, audio or images here<br>or click <b>＋ Import</b>
+        </div>
+      </div>
+    </aside>
+
+    <section id="preview">
+      <div id="stage">
+        <div id="stage-inner">
+          <div id="stage-blank">▶</div>
+          <!-- per-asset <video>/<img> elements injected here -->
+        </div>
+      </div>
+      <div id="transport">
+        <button id="btn-seek-start" title="Go to start (Home)">⏮</button>
+        <button id="btn-play" title="Play / pause (Space)">▶</button>
+        <button id="btn-seek-end" title="Go to end (End)">⏭</button>
+        <span id="time-display"><b id="time-cur">0:00.0</b> / <span id="time-total">0:00.0</span></span>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- ======================= TIMELINE ======================= -->
+  <section id="timeline-panel">
+    <div id="tl-toolbar">
+      <button id="btn-split"  class="tl-btn" title="Split clip at playhead (S)">✂ Split</button>
+      <button id="btn-dup"    class="tl-btn" title="Duplicate clip (Ctrl+D)">⧉ Duplicate</button>
+      <button id="btn-mute"   class="tl-btn" title="Mute clip audio (M)">🔇 Mute</button>
+      <button id="btn-delete" class="tl-btn" title="Delete clip (Del)">🗑 Delete</button>
+      <span class="tl-sep"></span>
+      <label class="vol-wrap" id="vol-wrap" title="Clip volume">
+        🔊 <input type="range" id="clip-volume" min="0" max="200" value="100">
+        <span id="vol-label">100%</span>
+      </label>
+      <span class="tl-flex"></span>
+      <button id="btn-undo" class="tl-btn" title="Undo (Ctrl+Z)">↩</button>
+      <button id="btn-redo" class="tl-btn" title="Redo (Ctrl+Y)">↪</button>
+      <span class="tl-sep"></span>
+      <label class="snap-wrap" title="Snap to clip edges & playhead">
+        <input type="checkbox" id="snap-toggle" checked> 🧲 Snap
+      </label>
+      <span class="tl-sep"></span>
+      🔍 <input type="range" id="zoom-slider" min="0" max="100" value="40" title="Zoom timeline">
+    </div>
+
+    <div id="timeline-body">
+      <div id="track-heads">
+        <div class="head-ruler"></div>
+        <!-- track heads injected -->
+      </div>
+      <div id="timeline-scroll">
+        <div id="timeline-content">
+          <div id="ruler"></div>
+          <div id="tracks"></div>
+          <div id="playhead"><div class="ph-cap"></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ======================= TOOLS ======================= -->
+<main id="tools" hidden>
+  <div id="tools-home">
+    <h1>Quick Tools</h1>
+    <p class="tools-sub">One-shot operations — drop a file, press go, download the result.</p>
+    <div id="tool-grid"></div>
+  </div>
+  <div id="tool-view" hidden>
+    <div class="tool-view-head">
+      <button id="btn-tools-back" class="btn-small">← All tools</button>
+      <h2 id="tool-title"></h2>
+    </div>
+    <div class="tool-view-body">
+      <div id="tool-form" class="tool-card"></div>
+      <div id="tool-results" class="tool-card">
+        <div class="results-placeholder">Results appear here</div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- ======================= EXPORT OVERLAY ======================= -->
+<div id="export-overlay" hidden>
+  <div class="export-box">
+    <h2 id="export-title">Exporting…</h2>
+    <div class="progress-outer"><div id="export-bar" class="progress-inner"></div></div>
+    <div id="export-pct">0%</div>
+    <div id="export-result" hidden></div>
+    <div class="export-actions">
+      <button id="btn-export-close" class="btn-small">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+<div id="drag-ghost" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
