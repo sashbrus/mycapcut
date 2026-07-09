@@ -127,6 +127,20 @@ def media_meta(path: Path) -> dict:
     return meta
 
 
+def extract_frame_png(src: str, t: float, dest: Path):
+    """Extract one frame at t. ffmpeg exits 0 with no output when t is past
+    the last decodable frame (container duration > video stream duration),
+    so retreat until a frame is actually produced."""
+    for tt in (t, t - 0.25, t - 1.0, 0.0):
+        if tt < 0:
+            continue
+        run([FFMPEG, "-y", "-ss", f"{tt:.3f}", "-i", str(src),
+             "-frames:v", "1", "-q:v", "2", str(dest)])
+        if dest.exists() and dest.stat().st_size > 0:
+            return
+    raise ToolError("Could not extract a video frame at this position.")
+
+
 def out_path(suffix: str, name: str = "") -> Path:
     stem = (name or "out") + "_" + uuid.uuid4().hex[:8]
     return OUT_DIR / f"{stem}{suffix}"
@@ -550,13 +564,82 @@ def api_frame(aid: str, t: float = 0.0):
         if a["kind"] == "image":
             run([FFMPEG, "-y", "-i", a["path"], "-frames:v", "1", str(out)])
         else:
-            run([FFMPEG, "-y", "-ss", f"{t:.3f}", "-i", a["path"],
-                 "-frames:v", "1", "-q:v", "2", str(out)])
+            extract_frame_png(a["path"], t, out)
     except ToolError as e:
         raise HTTPException(500, str(e))
     stem = Path(a["name"]).stem
     return FileResponse(out, filename=f"{stem}_frame_{t:.2f}s.png",
                         media_type="image/png")
+
+
+@app.post("/api/freeze_video")
+async def api_freeze_video(req: Request):
+    """Create a still video from one frame of an asset and add it to the library."""
+    body = await req.json()
+    try:
+        a = get_asset(body["assetId"])
+    except ToolError as e:
+        raise HTTPException(404, str(e))
+    if a["kind"] == "audio":
+        raise HTTPException(400, "Audio has no frames.")
+    t = float(body.get("t", 0.0))
+    dur = min(max(float(body.get("duration", 5)), 0.5), 60.0)
+    w = int(body.get("width", 1280))
+    h = int(body.get("height", 720))
+    fps = int(body.get("fps", 30))
+    if a["kind"] == "video":
+        t = min(max(0.0, t), max(0.0, a["duration"] - 0.03))
+    # optional soundtrack: a slice of another asset's audio (the song under
+    # the clip), starting at audioStart inside that asset's source
+    audio_asset = None
+    audio_start = 0.0
+    if body.get("audioAssetId"):
+        try:
+            audio_asset = get_asset(body["audioAssetId"])
+            audio_start = max(0.0, float(body.get("audioStart", 0.0)))
+        except ToolError:
+            audio_asset = None
+
+    frame = CACHE_DIR / f"freeze_{uuid.uuid4().hex[:8]}.png"
+    dest_dir = ASSETS_DIR / uuid.uuid4().hex[:8]
+    try:
+        extract_frame_png(a["path"], t, frame)
+        dest_dir.mkdir(parents=True)
+        name = f"{Path(a['name']).stem}_freeze_{dur:g}s.mp4"
+        dest = dest_dir / name
+        vchain = (f"[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                  f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1[v]")
+        if audio_asset:
+            # atrim decodes from 0 and cuts exactly; input-seeking (-ss -i)
+            # is imprecise on VBR MP3s and shifted the audio
+            cmd = [FFMPEG, "-y",
+                   "-loop", "1", "-framerate", str(fps), "-t", f"{dur:.3f}",
+                   "-i", str(frame),
+                   "-i", audio_asset["path"],
+                   "-filter_complex",
+                   f"{vchain};"
+                   f"[1:a]atrim=start={audio_start:.4f}:end={audio_start + dur:.4f},"
+                   f"asetpts=PTS-STARTPTS,aresample=44100,apad[aud]",
+                   "-map", "[v]", "-map", "[aud]",
+                   "-c:v", "libx264", "-preset", "fast", "-tune", "stillimage",
+                   "-crf", "20", "-pix_fmt", "yuv420p",
+                   "-c:a", "aac", "-b:a", "192k",
+                   "-t", f"{dur:.3f}", "-movflags", "+faststart", str(dest)]
+        else:
+            cmd = [FFMPEG, "-y",
+                   "-loop", "1", "-framerate", str(fps), "-t", f"{dur:.3f}",
+                   "-i", str(frame),
+                   "-filter_complex", vchain, "-map", "[v]",
+                   "-c:v", "libx264", "-preset", "fast", "-tune", "stillimage",
+                   "-crf", "20", "-pix_fmt", "yuv420p",
+                   "-t", f"{dur:.3f}", "-movflags", "+faststart", str(dest)]
+        run(cmd)
+        return register_asset(dest, name)
+    except ToolError as e:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        raise HTTPException(500, str(e))
+    finally:
+        frame.unlink(missing_ok=True)
 
 
 @app.post("/api/import_output")

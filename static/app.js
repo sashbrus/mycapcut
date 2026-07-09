@@ -211,6 +211,16 @@ async function uploadFiles(files) {
 
 const KIND_ICON = { video: "🎞", audio: "🎵", image: "🖼" };
 
+async function deleteAsset(a) {
+  if (!confirm(`Remove "${a.name}" from the library?\nClips using it will be removed from the timeline.`)) return;
+  await fetch(`/api/assets/${a.id}`, { method: "DELETE" });
+  delete state.assets[a.id];
+  pushHistory();
+  state.timeline.video = state.timeline.video.filter(c => c.assetId !== a.id);
+  state.timeline.audioTracks = state.timeline.audioTracks.map(tr => tr.filter(c => c.assetId !== a.id));
+  renderLibrary(); renderTimeline(); saveLocal();
+}
+
 function renderLibrary() {
   const list = $("#asset-list");
   list.innerHTML = "";
@@ -238,18 +248,21 @@ function renderLibrary() {
        <div class="asset-sub">${KIND_ICON[a.kind] || ""} ${sub}</div></div>
        <button class="asset-del" title="Remove from library">✕</button>`);
     $(".asset-name", card).textContent = a.name;
-    $(".asset-del", card).addEventListener("click", async (e) => {
+    $(".asset-del", card).addEventListener("click", (e) => {
       e.stopPropagation();
-      if (!confirm(`Remove "${a.name}" from the library?\nClips using it will be removed from the timeline.`)) return;
-      await fetch(`/api/assets/${a.id}`, { method: "DELETE" });
-      delete state.assets[a.id];
-      pushHistory();
-      state.timeline.video = state.timeline.video.filter(c => c.assetId !== a.id);
-      state.timeline.audioTracks = state.timeline.audioTracks.map(tr => tr.filter(c => c.assetId !== a.id));
-      renderLibrary(); renderTimeline(); saveLocal();
+      deleteAsset(a);
     });
     card.addEventListener("dblclick", () => addAssetToTimeline(a, null, null));
     card.addEventListener("pointerdown", (e) => beginLibraryDrag(e, a));
+    card.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      buildCtxMenu([
+        { label: "💾 Save as…", fn: () => saveAssetAs(a) },
+        { label: "➕ Add to timeline", fn: () => addAssetToTimeline(a, null, null) },
+        "sep",
+        { label: "🗑 Remove from library", fn: () => deleteAsset(a), danger: true },
+      ], e.clientX, e.clientY);
+    });
     list.appendChild(card);
   }
 }
@@ -553,14 +566,22 @@ function showClipMenu(e, clip) {
     if (asset.hasAudio)
       items.push({ label: "🧲 Match to audio track", fn: () => matchToAudio(clip) });
     items.push("sep",
+      { label: "⏸ Last frame → still video… ▸", keepOpen: true,
+        fn: (menu) => showFreezeSubmenu(menu, clip) },
       { label: "📸 Save last frame as PNG", fn: () => saveFrame(clip, clip.out - 0.04) },
       { label: "📸 Save first frame as PNG", fn: () => saveFrame(clip, clip.in) });
     if (phInside)
       items.push({ label: "📸 Save frame at playhead",
                    fn: () => saveFrame(clip, clip.in + state.playhead - clip.start) });
   }
+  items.push({ label: "💾 Save as… (source file)", fn: () => saveAssetAs(asset) });
   items.push("sep", { label: "🗑 Delete", fn: deleteSelected, danger: true });
 
+  buildCtxMenu(items, e.clientX, e.clientY);
+}
+
+function buildCtxMenu(items, x, y) {
+  hideClipMenu();
   const menu = document.createElement("div");
   menu.id = "ctx-menu";
   for (const it of items) {
@@ -572,13 +593,50 @@ function showClipMenu(e, clip) {
     b.textContent = it.label;
     if (it.danger) b.className = "danger";
     if (it.disabled) b.disabled = true;
-    b.addEventListener("click", () => { hideClipMenu(); it.fn(); });
+    b.addEventListener("click", () => {
+      if (it.keepOpen) it.fn(menu);
+      else { hideClipMenu(); it.fn(); }
+    });
     menu.appendChild(b);
   }
   document.body.appendChild(menu);
   const mw = menu.offsetWidth, mh = menu.offsetHeight;
-  menu.style.left = Math.min(e.clientX, innerWidth - mw - 8) + "px";
-  menu.style.top = Math.min(e.clientY, innerHeight - mh - 8) + "px";
+  menu.style.left = Math.min(x, innerWidth - mw - 8) + "px";
+  menu.style.top = Math.min(y, innerHeight - mh - 8) + "px";
+  return menu;
+}
+
+/** "Save as…" with a native file picker (Chrome); falls back to a download. */
+async function saveAssetAs(asset) {
+  if (!asset) return;
+  if (window.showSaveFilePicker) {
+    let handle;
+    try {
+      handle = await showSaveFilePicker({ suggestedName: asset.name });
+    } catch {
+      return; // user cancelled the dialog
+    }
+    try {
+      toast("💾 Saving…", false, 2000);
+      const resp = await fetch(`/media/${asset.id}`, { cache: "no-store" });
+      if (!resp.ok) throw new Error(`server returned ${resp.status}`);
+      const blob = await resp.blob();
+      if (!blob.size) throw new Error("server sent an empty file");
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      toast(`💾 Saved: ${handle.name || asset.name} (${(blob.size / 1048576).toFixed(1)} MB)`);
+      return;
+    } catch (e) {
+      toast("Save-as failed (" + e.message + ") — downloading instead…", true, 6000);
+    }
+  }
+  const aEl = document.createElement("a");
+  aEl.href = `/media/${asset.id}`;
+  aEl.download = asset.name;
+  document.body.appendChild(aEl);
+  aEl.click();
+  aEl.remove();
 }
 
 document.addEventListener("pointerdown", (e) => {
@@ -633,6 +691,71 @@ async function matchToAudio(clip) {
           (clamped ? "\n(shifted to avoid overlapping a neighbouring clip)" : ""), false, 6000);
   } catch (e) {
     toast("Match failed: " + e.message, true, 7000);
+  }
+}
+
+/** Duration picker (1–20 s) shown inside the context menu. */
+function showFreezeSubmenu(menu, clip) {
+  menu.innerHTML = `<div class="ctx-head">⏸ Still video from last frame — length:</div>`;
+  const grid = document.createElement("div");
+  grid.className = "ctx-grid";
+  for (let s = 1; s <= 20; s++) {
+    const b = document.createElement("button");
+    b.textContent = s + "s";
+    b.addEventListener("click", () => { hideClipMenu(); freezeLastFrame(clip, s); });
+    grid.appendChild(b);
+  }
+  menu.appendChild(grid);
+}
+
+/** Make a still video of the clip's last frame + the song slice that starts
+    where the clip ends (like the Image+Audio→MP4 tool, but on the fly).
+    Adds it to the library and inserts it right after the clip. */
+async function freezeLastFrame(clip, dur) {
+  const s = projSettings();
+  const at = clipEnd(clip); // timeline point where the freeze begins
+
+  // find the audio clip lying under that timeline point — mute states are
+  // ignored on purpose: muted is a playback setting, the content is still there
+  let song = null, songAudible = false;
+  for (let ti = 0; ti < state.timeline.audioTracks.length && !song; ti++) {
+    for (const ac of state.timeline.audioTracks[ti]) {
+      if (at >= ac.start - 0.01 && at < clipEnd(ac)) {
+        song = ac;
+        songAudible = !ac.muted && !state.timeline.audioMuted[ti];
+        break;
+      }
+    }
+  }
+  toast(`⏸ Creating ${dur}s still video` +
+        (song ? " with the song continuing from the cut point…" : " (no audio track under this point — silent)…"));
+  try {
+    const asset = await apiJSON("/api/freeze_video", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        assetId: clip.assetId, t: clip.out - 0.04, duration: dur,
+        width: s.width, height: s.height, fps: s.fps,
+        audioAssetId: song ? song.assetId : null,
+        audioStart: song ? at - song.start + song.in : 0,
+      }),
+    });
+    state.assets[asset.id] = asset;
+    renderLibrary();
+    pushHistory();
+    for (const c of state.timeline.video)
+      if (c.id !== clip.id && c.start >= at - 0.01) c.start += asset.duration;
+    // if the song track is audible below, mute the inserted clip so the sound
+    // isn't doubled; if the track is muted, keep the clip's own audio audible
+    const newClip = { id: uid(), assetId: asset.id, start: at,
+                      in: 0, out: asset.duration, volume: 1,
+                      muted: !!song && songAudible };
+    state.timeline.video.push(newClip);
+    state.selection = newClip.id;
+    renderTimeline(); saveLocal();
+    toast(`⏸ ${dur}s freeze-frame${song ? " + song audio" : ""} inserted after the clip (also in Media)`);
+  } catch (e) {
+    toast("Freeze failed: " + e.message, true, 7000);
   }
 }
 
@@ -854,7 +977,7 @@ function updateStage(t, playing) {
     } else if (asset) {
       const v = ensureVideoEl(asset);
       const target = t - vclip.start + vclip.in;
-      if (Math.abs(v.currentTime - target) > 0.22) v.currentTime = target;
+      if (Math.abs(v.currentTime - target) > 0.12) v.currentTime = target;
       v.volume = (vclip.muted || state.timeline.videoMuted)
         ? 0 : Math.min(1, vclip.volume ?? 1);
       if (playing && v.paused) v.play().catch(() => {});
@@ -879,7 +1002,7 @@ function updateStage(t, playing) {
         activeIds.add(clip.id);
         const a = ensureAudioEl(clip);
         const target = t - clip.start + clip.in;
-        if (Math.abs(a.currentTime - target) > 0.25) a.currentTime = target;
+        if (Math.abs(a.currentTime - target) > 0.12) a.currentTime = target;
         a.volume = Math.min(1, clip.volume ?? 1);
         if (playing && a.paused) a.play().catch(() => {});
         if (!playing && !a.paused) a.pause();
@@ -1447,10 +1570,13 @@ document.addEventListener("keydown", (e) => {
 
 (async function init() {
   renderToolGrid();
-  try {
-    await loadAssets();
-  } catch (e) {
-    toast("Could not reach the server: " + e.message, true);
+  // never start with a half-loaded app: wait for the server, retrying
+  for (;;) {
+    try { await loadAssets(); break; }
+    catch {
+      toast("Server not reachable — retrying…", true, 1800);
+      await new Promise(r => setTimeout(r, 2000));
+    }
   }
   await restoreProject();
   fitStage();
