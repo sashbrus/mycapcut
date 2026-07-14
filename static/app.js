@@ -498,6 +498,9 @@ function buildClipEl(clip, trackType) {
     const strip = document.createElement("div");
     strip.className = "clip-strip";
     strip.style.backgroundImage = `url(/api/filmstrip/${asset.id})`;
+    // anchor thumbnails to the content, so left-trimming doesn't look like
+    // the video is sliding along with the box
+    strip.style.backgroundPosition = `${(-clip.in * state.pps).toFixed(1)}px 0`;
     el.appendChild(strip);
   } else if (kind === "image" && asset) {
     const strip = document.createElement("div");
@@ -864,6 +867,10 @@ function beginClipEdit(e, clip, el, mode) {
     }
     el.style.left = (clip.start * state.pps) + "px";
     el.style.width = Math.max(clipDur(clip) * state.pps, 14) + "px";
+    if (mode === "trim-left") {
+      const strip = el.querySelector(".clip-strip");
+      if (strip) strip.style.backgroundPosition = `${(-clip.in * state.pps).toFixed(1)}px 0`;
+    }
     updateTimeDisplay();
   };
   const up = () => {
@@ -1260,6 +1267,16 @@ const TOOL_DEFS = [
     fields: [
       { name: "which", type: "radio", label: "Which frame", options: [["last", "Last"], ["first", "First"], ["middle", "Middle"], ["at", "At time…"]], value: "last" },
       { name: "timestamp", type: "text", label: "Timestamp (for 'At time')", placeholder: "e.g. 0:30" },
+    ],
+  },
+  {
+    id: "resize", icon: "📐", title: "Resize / downscale",
+    desc: "Change video or image to any exact size, e.g. 1644×3072 → 704×1280.",
+    files: [{ name: "file", label: "Video or image", accept: "video/*,image/*" }],
+    fields: [
+      { name: "width", type: "number", label: "Target width", value: 704, step: 2 },
+      { name: "height", type: "number", label: "Target height", value: 1280, step: 2 },
+      { name: "mode", type: "radio", label: "Aspect handling", options: [["crop", "Fill & crop (no bars)"], ["fit", "Fit (black bars)"], ["stretch", "Stretch exactly"]], value: "crop" },
     ],
   },
   {

@@ -15,6 +15,7 @@
   <nav class="mode-tabs">
     <button id="tab-studio" class="mode-tab active">Studio</button>
     <button id="tab-tools" class="mode-tab">Tools</button>
+    <button id="tab-ninja" class="mode-tab">🥷 Ninja Director</button>
   </nav>
   <div class="topbar-right">
     <select id="proj-res" title="Project resolution">
@@ -130,6 +131,131 @@
   </div>
 </main>
 
+<!-- ======================= NINJA DIRECTOR ======================= -->
+<main id="ninja" hidden>
+  <div class="nj-head">
+    <nav class="nj-tabs">
+      <button id="nj-tab-director" class="nj-tab active">🎬 Director</button>
+      <button id="nj-tab-upscaler" class="nj-tab">🔍 Upscaler</button>
+      <button id="nj-tab-settings" class="nj-tab">⚙ Hosts & Templates</button>
+    </nav>
+    <div id="nj-progress-wrap" hidden>
+      <div class="progress-outer"><div id="nj-progress" class="progress-inner"></div></div>
+      <span id="nj-progress-text"></span>
+    </div>
+  </div>
+
+  <!-- ------- Director ------- -->
+  <section id="nj-director" class="nj-body">
+    <div class="nj-col">
+      <div class="tool-card">
+        <h3>Song</h3>
+        <div id="nj-song-info" class="nj-muted">No song loaded.</div>
+        <label class="btn-small nj-file-btn">♪ Load song
+          <input type="file" id="nj-song-file" accept="audio/*" hidden></label>
+        <label class="btn-small nj-file-btn" title="Start/continue from an existing video (e.g. your ready part1.mp4). Uses the 'From (s)' field as its position in the song.">📼 Import starting part
+          <input type="file" id="nj-part-file" accept="video/*" hidden></label>
+        <button id="nj-reset" class="btn-small">↺ Reset project</button>
+      </div>
+
+      <div class="tool-card" id="nj-compose">
+        <h3>Next chunk</h3>
+        <div id="nj-tail-info" class="nj-muted"></div>
+        <div class="nj-row" id="nj-img-row">
+          <label>Start image (optional):</label>
+          <input type="file" id="nj-img-file" accept="image/*">
+        </div>
+        <div class="nj-row">
+          <label>From (s)</label><input type="number" id="nj-from" step="0.1" style="width:80px">
+          <label>Length (s) — you decide, end on a finished word!</label>
+          <input type="number" id="nj-len" value="20" step="0.5" style="width:80px">
+          <label>Host</label>
+          <select id="nj-run-host"><option value="">active</option>
+            <option value="local">local</option><option value="remote">remote</option></select>
+        </div>
+        <label>Global prompt</label>
+        <textarea id="nj-global" rows="2"
+          placeholder="The young OHWXPERSON woman sings… camera static…"></textarea>
+        <div class="nj-row"><label>Text segments</label>
+          <button id="nj-add-prompt" class="btn-small">＋ [txt]</button></div>
+        <div id="nj-prompts"></div>
+        <button id="nj-generate" class="btn-accent">▶ Generate chunk</button>
+      </div>
+
+      <div class="tool-card" id="nj-review" hidden>
+        <h3 id="nj-review-title">Review</h3>
+        <video id="nj-review-video" controls style="width:100%;max-height:420px"></video>
+        <div class="nj-row">
+          <button id="nj-retake" class="btn-small">🎲 Retake (new seed)</button>
+          <button id="nj-continue" class="btn-accent">✔ Continue → finalize + prep tail</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="nj-col nj-col-side">
+      <div class="tool-card">
+        <h3>Parts</h3>
+        <div id="nj-parts"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ------- Upscaler ------- -->
+  <section id="nj-upscaler" class="nj-body" hidden>
+    <div class="tool-card">
+      <h3>Chained IC-Upscale</h3>
+      <p class="nj-muted">Splits into chunks, upscales each, chains every chunk's last frame
+        as the next chunk's anchor, reassembles with original audio.</p>
+      <div class="nj-row"><label>Video</label><input type="file" id="nj-up-file" accept="video/*"></div>
+      <div class="nj-row"><label>First-chunk anchor image (optional)</label>
+        <input type="file" id="nj-up-anchor" accept="image/*"></div>
+      <div class="nj-row">
+        <label>Chunk (s)</label><input type="number" id="nj-up-chunk" value="10" style="width:70px">
+        <label>Denoise</label><input type="number" id="nj-up-den" value="1.0" step="0.05" style="width:70px">
+        <label>Multiplier</label><input type="number" id="nj-up-mult" value="1.3" step="0.05" style="width:70px">
+        <label>Host</label>
+        <select id="nj-up-host"><option value="">active</option>
+          <option value="local">local</option><option value="remote">remote</option></select>
+      </div>
+      <button id="nj-up-run" class="btn-accent">▶ Upscale</button>
+    </div>
+  </section>
+
+  <!-- ------- Settings ------- -->
+  <section id="nj-settings" class="nj-body" hidden>
+    <div class="tool-card">
+      <h3>ComfyUI hosts</h3>
+      <div class="nj-row"><label style="width:60px">local</label>
+        <input id="nj-host-local" style="flex:1" placeholder="http://127.0.0.1:8188">
+        <button class="btn-small" data-ping="local">Ping</button></div>
+      <div class="nj-row"><label style="width:60px">remote</label>
+        <input id="nj-host-remote" style="flex:1" placeholder="https://xxx-8188.proxy.runpod.net or tunneled URL">
+        <button class="btn-small" data-ping="remote">Ping</button></div>
+      <div class="nj-row"><label>Active host</label>
+        <select id="nj-active-host"><option>local</option><option>remote</option></select></div>
+      <h3>Pipeline settings</h3>
+      <div class="nj-row">
+        <label>Tail (s)</label><input type="number" id="nj-set-tail" step="0.5" style="width:70px">
+        <label>Tail denoise</label><input type="number" id="nj-set-den" step="0.05" style="width:70px">
+        <label>Tail ×</label><input type="number" id="nj-set-mult" step="0.05" style="width:70px">
+        <label>W</label><input type="number" id="nj-set-w" step="32" style="width:80px">
+        <label>H</label><input type="number" id="nj-set-h" step="32" style="width:80px">
+      </div>
+      <button id="nj-save-config" class="btn-accent">💾 Save</button>
+      <h3>Workflow templates <span class="nj-muted">(run once manually in ComfyUI → Capture)</span></h3>
+      <table class="nj-tpl-table">
+        <tr><th></th><th>director</th><th>upscaler</th></tr>
+        <tr><td>local</td>
+          <td><span id="nj-tpl-local-director"></span> <button class="btn-small" data-capture="local:director">Capture</button></td>
+          <td><span id="nj-tpl-local-upscaler"></span> <button class="btn-small" data-capture="local:upscaler">Capture</button></td></tr>
+        <tr><td>remote</td>
+          <td><span id="nj-tpl-remote-director"></span> <button class="btn-small" data-capture="remote:director">Capture</button></td>
+          <td><span id="nj-tpl-remote-upscaler"></span> <button class="btn-small" data-capture="remote:upscaler">Capture</button></td></tr>
+      </table>
+    </div>
+  </section>
+</main>
+
 <!-- ======================= EXPORT OVERLAY ======================= -->
 <div id="export-overlay" hidden>
   <div class="export-box">
@@ -147,5 +273,6 @@
 <div id="drag-ghost" hidden></div>
 
 <script src="app.js"></script>
+<script src="ninja.js"></script>
 </body>
 </html>

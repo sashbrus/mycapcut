@@ -707,6 +707,15 @@ def _dur(path: Path) -> float:
 
 # ---- individual tool implementations (run inside a job thread) ------------
 
+def seek_args(s: float) -> tuple[list[str], list[str]]:
+    """Sample-accurate seek: coarse input seek (fast) + precise output seek.
+    Plain input seeking (-ss before -i) is imprecise on MP3/VBR files."""
+    coarse = max(0.0, s - 2.0)
+    pre = ["-ss", f"{coarse:.3f}"] if coarse > 0 else []
+    post = ["-ss", f"{s - coarse:.3f}"] if s > 0 else []
+    return pre, post
+
+
 def tool_trim_split(job, fields, files):
     src = files["file"][0]
     meta = media_meta(src)
@@ -722,12 +731,9 @@ def tool_trim_split(job, fields, files):
         if e <= s:
             raise ToolError(f"End ({fmt_ts(e)}) must be after start ({fmt_ts(s)}).")
         out = out_path(ext, "trim")
-        if audio_only:
-            cmd = [FFMPEG, "-y", "-ss", f"{s:.3f}", "-to", f"{e:.3f}", "-i", src,
-                   "-vn", *acodec, out]
-        else:
-            cmd = [FFMPEG, "-y", "-ss", f"{s:.3f}", "-to", f"{e:.3f}", "-i", src,
-                   *enc_video(), *acodec, out]
+        pre, post = seek_args(s)
+        enc = ["-vn", *acodec] if audio_only else [*enc_video(), *acodec]
+        cmd = [FFMPEG, "-y", *pre, "-i", src, *post, "-t", f"{e - s:.3f}", *enc, out]
         run_ffmpeg_progress(cmd, e - s, job)
         return [output_entry(out, "audio" if audio_only else "video")]
 
@@ -738,9 +744,10 @@ def tool_trim_split(job, fields, files):
     p1 = out_path(ext, "part1")
     p2 = out_path(ext, "part2")
     enc = ["-vn", *acodec] if audio_only else [*enc_video(), *acodec]
-    run_ffmpeg_progress([FFMPEG, "-y", "-i", src, "-to", f"{s:.3f}", *enc, p1], s, job)
+    run_ffmpeg_progress([FFMPEG, "-y", "-i", src, "-t", f"{s:.3f}", *enc, p1], s, job)
     job["progress"] = 0.5
-    run_ffmpeg_progress([FFMPEG, "-y", "-ss", f"{s:.3f}", "-i", src, *enc, p2], dur - s, job)
+    pre, post = seek_args(s)
+    run_ffmpeg_progress([FFMPEG, "-y", *pre, "-i", src, *post, *enc, p2], dur - s, job)
     kind = "audio" if audio_only else "video"
     return [output_entry(p1, kind), output_entry(p2, kind)]
 
@@ -982,8 +989,39 @@ def tool_volume(job, fields, files):
     return [output_entry(out, "video")]
 
 
+def tool_resize(job, fields, files):
+    src = files["file"][0]
+    meta = media_meta(src)
+    w = int(fields.get("width", 704))
+    h = int(fields.get("height", 1280))
+    w -= w % 2
+    h -= h % 2
+    if not (16 <= w <= 7680 and 16 <= h <= 7680):
+        raise ToolError("Target size must be between 16 and 7680.")
+    mode = fields.get("mode", "crop")
+    if mode == "stretch":
+        vf = f"scale={w}:{h},setsar=1"
+    elif mode == "fit":
+        vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+              f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1")
+    else:  # crop-fill
+        vf = (f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+              f"crop={w}:{h},setsar=1")
+    if meta["kind"] == "image":
+        out = out_path(".png", "resized")
+        run([FFMPEG, "-y", "-i", src, "-vf", vf, "-frames:v", "1", out])
+        return [output_entry(out, "image")]
+    out = out_path(".mp4", "resized")
+    cmd = [FFMPEG, "-y", "-i", src, "-vf", vf, *enc_video()]
+    cmd += enc_audio() if meta["hasAudio"] else ["-an"]
+    cmd.append(out)
+    run_ffmpeg_progress(cmd, meta["duration"], job)
+    return [output_entry(out, "video")]
+
+
 TOOLS = {
     "trim_split": tool_trim_split,
+    "resize": tool_resize,
     "join_videos": tool_join_videos,
     "join_audio": tool_join_audio,
     "attach_audio": tool_attach_audio,
@@ -1198,6 +1236,26 @@ async def api_export(req: Request):
 
 
 # ---------------------------------------------------------------------------
+# Ninja Director (ComfyUI pipeline) — see comfyui_ninja.py
+# ---------------------------------------------------------------------------
+
+import urllib.parse
+
+import comfyui_ninja
+
+comfyui_ninja.register(app, {
+    "DATA": DATA, "OUT_DIR": OUT_DIR, "FFMPEG": FFMPEG,
+    "run": run, "ffprobe": ffprobe, "start_job": start_job,
+    "output_entry": output_entry, "ToolError": ToolError,
+    "asset_path": lambda aid: Path(get_asset(aid)["path"]),
+    "output_entry_abs": lambda path, kind, name=None: {
+        "name": name or path.name, "kind": kind,
+        "url": "/api/ninja/file?path=" + urllib.parse.quote(str(path)),
+        "path": str(path)},
+})
+
+
+# ---------------------------------------------------------------------------
 # Static
 # ---------------------------------------------------------------------------
 
@@ -1213,7 +1271,31 @@ app.mount("/outputs", StaticFiles(directory=str(OUT_DIR)), name="outputs")
 app.mount("/", NoCacheStatic(directory=str(ROOT / "static"), html=True), name="static")
 
 
+def _kill_stale_instance(port: int):
+    """If a previous CupCut process is still holding the port (window closed but
+    process alive), kill it so a fresh start always loads the current code."""
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True,
+                             text=True, timeout=10).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[1].endswith(f":{port}") and parts[3] == "LISTENING":
+                pid = int(parts[4])
+                if pid == os.getpid():
+                    continue
+                name = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                                      capture_output=True, text=True, timeout=10).stdout
+                if "python" in name.lower():
+                    subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                                   capture_output=True, timeout=10)
+                    log.info("Killed stale CupCut instance (PID %s) on port %s", pid, port)
+                    time.sleep(1.0)
+    except Exception as e:
+        log.warning("Stale-instance check failed: %s", e)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8765))
+    _kill_stale_instance(port)
     threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
