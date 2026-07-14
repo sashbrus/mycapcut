@@ -169,9 +169,10 @@
           <label>From (s)</label><input type="number" id="nj-from" step="0.1" style="width:80px">
           <label>Length (s) — you decide, end on a finished word!</label>
           <input type="number" id="nj-len" value="20" step="0.5" style="width:80px">
-          <label>Host</label>
-          <select id="nj-run-host"><option value="">active</option>
-            <option value="local">local</option><option value="remote">remote</option></select>
+          <label title="0/0 = use the pinned video's own size (recommended)">W</label>
+          <input type="number" id="nj-gen-w" step="32" style="width:80px">
+          <label>H</label>
+          <input type="number" id="nj-gen-h" step="32" style="width:80px">
         </div>
         <label>Global prompt</label>
         <textarea id="nj-global" rows="2"
@@ -187,6 +188,9 @@
         <video id="nj-review-video" controls style="width:100%;max-height:420px"></video>
         <div class="nj-row">
           <button id="nj-retake" class="btn-small">🎲 Retake (new seed)</button>
+          <label>length (s)</label>
+          <input type="number" id="nj-retake-len" step="0.5" style="width:80px"
+                 title="Optional: change the chunk length for the retake (e.g. to end on a finished word)">
           <button id="nj-continue" class="btn-accent">✔ Continue → finalize + prep tail</button>
         </div>
       </div>
@@ -213,9 +217,6 @@
         <label>Chunk (s)</label><input type="number" id="nj-up-chunk" value="10" style="width:70px">
         <label>Denoise</label><input type="number" id="nj-up-den" value="1.0" step="0.05" style="width:70px">
         <label>Multiplier</label><input type="number" id="nj-up-mult" value="1.3" step="0.05" style="width:70px">
-        <label>Host</label>
-        <select id="nj-up-host"><option value="">active</option>
-          <option value="local">local</option><option value="remote">remote</option></select>
       </div>
       <button id="nj-up-run" class="btn-accent">▶ Upscale</button>
     </div>
@@ -224,15 +225,13 @@
   <!-- ------- Settings ------- -->
   <section id="nj-settings" class="nj-body" hidden>
     <div class="tool-card">
-      <h3>ComfyUI hosts</h3>
-      <div class="nj-row"><label style="width:60px">local</label>
-        <input id="nj-host-local" style="flex:1" placeholder="http://127.0.0.1:8188">
-        <button class="btn-small" data-ping="local">Ping</button></div>
-      <div class="nj-row"><label style="width:60px">remote</label>
-        <input id="nj-host-remote" style="flex:1" placeholder="https://xxx-8188.proxy.runpod.net or tunneled URL">
-        <button class="btn-small" data-ping="remote">Ping</button></div>
-      <div class="nj-row"><label>Active host</label>
-        <select id="nj-active-host"><option>local</option><option>remote</option></select></div>
+      <h3>ComfyUI hosts <span class="nj-muted">(same URL or two machines — Director runs go to the Director host, upscale runs to the Upscaler host)</span></h3>
+      <div class="nj-row"><label style="width:110px">Director host</label>
+        <input id="nj-host-director" style="flex:1" placeholder="http://127.0.0.1:8188">
+        <button class="btn-small" data-ping="director">Ping</button></div>
+      <div class="nj-row"><label style="width:110px">Upscaler host</label>
+        <input id="nj-host-upscaler" style="flex:1" placeholder="http://127.0.0.1:8188 or https://xxx-8188.proxy.runpod.net">
+        <button class="btn-small" data-ping="upscaler">Ping</button></div>
       <h3>Pipeline settings</h3>
       <div class="nj-row">
         <label>Tail (s)</label><input type="number" id="nj-set-tail" step="0.5" style="width:70px">
@@ -242,16 +241,15 @@
         <label>H</label><input type="number" id="nj-set-h" step="32" style="width:80px">
       </div>
       <button id="nj-save-config" class="btn-accent">💾 Save</button>
-      <h3>Workflow templates <span class="nj-muted">(run once manually in ComfyUI → Capture)</span></h3>
+      <h3>Workflow templates <span class="nj-muted">(run the workflow once manually on its host → Capture)</span></h3>
       <table class="nj-tpl-table">
-        <tr><th></th><th>director</th><th>upscaler</th></tr>
-        <tr><td>local</td>
-          <td><span id="nj-tpl-local-director"></span> <button class="btn-small" data-capture="local:director">Capture</button></td>
-          <td><span id="nj-tpl-local-upscaler"></span> <button class="btn-small" data-capture="local:upscaler">Capture</button></td></tr>
-        <tr><td>remote</td>
-          <td><span id="nj-tpl-remote-director"></span> <button class="btn-small" data-capture="remote:director">Capture</button></td>
-          <td><span id="nj-tpl-remote-upscaler"></span> <button class="btn-small" data-capture="remote:upscaler">Capture</button></td></tr>
+        <tr><td>Director template</td>
+          <td><span id="nj-tpl-director"></span> <button class="btn-small" data-capture="director">Capture</button></td></tr>
+        <tr><td>Upscaler template</td>
+          <td><span id="nj-tpl-upscaler"></span> <button class="btn-small" data-capture="upscaler">Capture</button></td></tr>
       </table>
+      <p class="nj-muted">Changed a host URL to a different machine? Re-capture that template —
+        model files differ between machines.</p>
     </div>
   </section>
 </main>
