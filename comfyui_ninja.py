@@ -51,10 +51,6 @@ DEFAULT_CFG = {
     },
 }
 
-# TEMP switch (user request 2026-07-15): tail upscale disabled for fast testing
-# of the dimension fix. Set back to True to restore the quality-refresh step.
-TAIL_UPSCALE = False
-
 # node classes that identify a template kind
 KIND_MARKERS = {"director": "LTXDirector", "upscaler": "RTXVideoSuperResolution"}
 
@@ -391,7 +387,11 @@ def job_generate(job, host: str, p: dict, req: dict):
     fps = int(s["frame_rate"])
     from_sec, to_sec = float(req["from_sec"]), float(req["to_sec"])
     tail = p.get("pending_tail")            # set by 'continue' of previous chunk
-    # exact tail length measured from the actual upscaled file (LTX snaps to 8n+1
+    # source: "extend" = continue from the previous part's tail (default);
+    # "new" = fresh scene (a cut) — text/image start, tail ignored
+    if req.get("source") == "new":
+        tail = None
+    # exact tail length measured from the actual tail file (LTX snaps to 8n+1
     # frames, so the nominal 5s tail is really e.g. 113 frames = 4.7083s)
     tail_seconds = float(tail["seconds"]) if tail else 0.0
     n = len([c for c in p["chunks"] if c.get("final")]) + 1
@@ -411,7 +411,7 @@ def job_generate(job, host: str, p: dict, req: dict):
     tail_file = image_file = None
     if tail:
         tail_file = comfy_upload(host, Path(tail["path"]), Path(tail["path"]).name)
-    elif req.get("image_asset"):
+    if not tail and req.get("image_asset"):
         a = DEPS["asset_path"](req["image_asset"])
         image_file = comfy_upload(host, a, a.name)
     job["progress"] = 0.2
@@ -452,14 +452,20 @@ def job_generate(job, host: str, p: dict, req: dict):
              "request": req, "host": host}
 
     # cumulative review preview: all approved parts + this candidate (exact-trimmed)
-    # + ORIGINAL song audio — the seams are what the user judges, not the part alone
+    # + ORIGINAL song audio — the seams are what the user judges, not the part alone.
+    # ALWAYS 8-bit yuv420p: LTX outputs 10-bit which browsers cannot play.
+    # Preview scales to the PROJECT grid (part1's real size — never stale, never default).
     job["message"] = "building cumulative preview"
     try:
+        if not p.get("work_resolution"):
+            src0 = Path(p["chunks"][0]["raw"]) if p["chunks"] else raw
+            finfo = DEPS["ffprobe"](src0)
+            fst = next((st for st in finfo.get("streams", []) if st.get("codec_type") == "video"), {})
+            p["work_resolution"] = {"w": int(fst.get("width", 0)), "h": int(fst.get("height", 0))}
+            save_project(p)
+        wr = p["work_resolution"]
+        cvf = ["-vf", f"scale={wr['w']}:{wr['h']}:flags=lanczos", "-pix_fmt", "yuv420p"]
         cand = work / f"{part_name}_candidate.mp4"
-        cvf = []
-        if p.get("work_resolution"):
-            wr = p["work_resolution"]
-            cvf = ["-vf", f"scale={wr['w']}:{wr['h']}:flags=lanczos"]
         if chunk["tail_used"] and tail_seconds > 0:
             ffmpeg(job, ["-ss", f"{tail_seconds:.6f}", "-i", str(raw),
                          "-t", f"{to_sec - from_sec:.6f}", *cvf, "-c:v", "libx264", "-crf", "12",
@@ -473,7 +479,8 @@ def job_generate(job, host: str, p: dict, req: dict):
         lst.write_text("".join(f"file '{x}'\n" for x in seq), encoding="utf-8")
         joined = work / f"{part_name}_joined_v.mp4"
         DEPS["run"]([DEPS["FFMPEG"], "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-                     "-i", str(lst), "-an", "-c:v", "libx264", "-crf", "14", "-preset", "fast",
+                     "-i", str(lst), "-an", "-vf", f"scale={wr['w']}:{wr['h']}:flags=lanczos",
+                     "-pix_fmt", "yuv420p", "-c:v", "libx264", "-crf", "14", "-preset", "fast",
                      str(joined)])
         preview = work / f"{part_name}_preview.mp4"
         first_from = min(float(c["from"]) for c in p["chunks"] if c.get("final")) if \
@@ -484,7 +491,15 @@ def job_generate(job, host: str, p: dict, req: dict):
                      "-shortest", str(preview)])
         chunk["preview"] = str(preview)
     except Exception:
-        chunk["preview"] = None  # preview is best-effort; raw is always reviewable
+        # fallback: at least a browser-safe re-encode of the raw chunk alone
+        try:
+            safe = work / f"{part_name}_review.mp4"
+            ffmpeg(job, ["-i", str(raw), "-pix_fmt", "yuv420p", "-c:v", "libx264",
+                         "-crf", "14", "-preset", "fast", "-c:a", "aac", str(safe)],
+                   "building safe review file")
+            chunk["preview"] = str(safe)
+        except Exception:
+            chunk["preview"] = None
     p["chunks"] = [c for c in p["chunks"] if c.get("final")] + [chunk]
     save_project(p)
     outs = [DEPS["output_entry_abs"](raw, "video", f"{part_name} (raw)")]
@@ -494,13 +509,25 @@ def job_generate(job, host: str, p: dict, req: dict):
     return outs
 
 
-def job_continue(job, host: str, p: dict):
-    """Approve last chunk: trim guidance overlap -> save final part -> build next tail."""
+def job_continue(job, host: str, p: dict, accept_sec: float | None = None,
+                 upscale_tail: bool = False):
+    """Approve last chunk: trim guidance overlap -> save final part -> build next tail.
+    accept_sec: optionally accept only the FIRST N seconds of the generated chunk.
+    upscale_tail: refresh the tail through the upscale workflow before pinning."""
     s = cfg()["settings"]
     chunk = p["chunks"][-1]
     raw = Path(chunk["raw"])
     parts_dir = NINJA_DIR / "parts"; parts_dir.mkdir(parents=True, exist_ok=True)
     work = NINJA_DIR / "work"; work.mkdir(parents=True, exist_ok=True)
+
+    # quantum accept: keep only the first N seconds of the generation
+    full_len = float(chunk["to"]) - float(chunk["from"])
+    if accept_sec:
+        accept_sec = float(accept_sec)
+        if 0 < accept_sec < full_len:
+            chunk["to"] = round(float(chunk["from"]) + accept_sec, 3)
+            prefix = chunk["part"].split("-")[0]
+            chunk["part"] = f"{prefix}-{int(chunk['from'])}-{int(chunk['to'])}"
 
     # 1. final part = raw minus the tail overlap at the start, EXACTLY (to-from) long
     #    (LTX outputs 8n+1 frames — the dangling extra frame is dropped at the end
@@ -519,11 +546,11 @@ def job_continue(job, host: str, p: dict):
     vf = ["-vf", f"scale={wr['w']}:{wr['h']}:flags=lanczos"]
     if chunk["tail_used"] and chunk["tail_seconds"] > 0:
         ffmpeg(job, ["-ss", f"{chunk['tail_seconds']:.6f}", "-i", str(raw),
-                     "-t", f"{exact_len:.6f}", *vf,
+                     "-t", f"{exact_len:.6f}", *vf, "-pix_fmt", "yuv420p",
                      "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-c:a", "aac",
                      str(final)], "trimming guidance overlap")
     else:
-        ffmpeg(job, ["-i", str(raw), "-t", f"{exact_len:.6f}", *vf,
+        ffmpeg(job, ["-i", str(raw), "-t", f"{exact_len:.6f}", *vf, "-pix_fmt", "yuv420p",
                      "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-c:a", "aac",
                      str(final)], "saving part (exact length)")
     job["progress"] = 0.2
@@ -535,14 +562,16 @@ def job_continue(job, host: str, p: dict):
     fps = int(s["frame_rate"])
     want = int(float(s["tail_seconds"]) * fps)
     tail_frames_cut = max(9, ((want - 1) // 8) * 8 + 1)
+    # the tail must end exactly where the ACCEPTED content ends
+    tail_start = max(0.0, float(chunk["tail_seconds"]) + exact_len - tail_frames_cut / fps)
     tail_cut = work / f"{chunk['part']}_tailcut.mp4"
-    ffmpeg(job, ["-sseof", f"-{(tail_frames_cut + 1) / fps:.6f}", "-i", str(raw),
+    ffmpeg(job, ["-ss", f"{tail_start:.6f}", "-i", str(raw),
                  "-frames:v", str(tail_frames_cut),
                  "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-c:a", "aac",
                  str(tail_cut)], "cutting tail")
     job["progress"] = 0.3
 
-    if TAIL_UPSCALE:
+    if upscale_tail:
         tail_file = comfy_upload(host, tail_cut, tail_cut.name)
         graph = build_upscale_graph(host, video_file=tail_file, anchor_file=None,
                                     denoise=float(s["tail_upscale_denoise"]),
@@ -562,12 +591,12 @@ def job_continue(job, host: str, p: dict):
                      "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-c:a", "aac",
                      str(tail_up)], "downscaling tail back to project resolution")
     else:
-        # TEMP: tail upscale OFF for fast dimension testing (user request 2026-07-15)
+        # raw tail, no refresh — user's choice per Continue (checkbox)
         wr = p["work_resolution"]
         tail_up = work / f"{chunk['part']}_tail_raw.mp4"
         ffmpeg(job, ["-i", str(tail_cut), "-vf", f"scale={wr['w']}:{wr['h']}:flags=lanczos",
                      "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-c:a", "aac",
-                     str(tail_up)], "normalizing raw tail (upscale disabled)")
+                     str(tail_up)], "normalizing raw tail (no upscale)")
 
     # measure the ACTUAL frame count (upscaler snaps to 8n+1) — the next chunk's
     # timeline and audio slice must use this exact length
@@ -586,6 +615,176 @@ def job_continue(job, host: str, p: dict):
     save_project(p)
     return [DEPS["output_entry_abs"](final, "video", f"{chunk['part']} FINAL"),
             DEPS["output_entry_abs"](tail_up, "video", "next tail (upscaled, back to project res)")]
+
+
+# ---------------------------------------------------------------- retake (clip patching)
+
+RETAKE_MIN_S, RETAKE_MAX_S = 2.0, 20.0
+
+
+def retake_session_file() -> Path:
+    return NINJA_DIR / "retake" / "session.json"
+
+
+def retake_session() -> dict:
+    return _load_json(retake_session_file(), {"clip": None, "pending": None})
+
+
+def save_retake_session(sess: dict):
+    _save_json(retake_session_file(), sess)
+
+
+def build_retake_graph(*, prompts: list, global_prompt: str, fps: int, total: int,
+                       head: int, start_image: str | None, end_image: str,
+                       lead_video: str | None, audio_file: str, part_name: str) -> dict:
+    """Director graph for a window patch:
+    mode 1: [start-frame image anchor][text...][end-frame image anchor]
+    mode 2: [lead-in video (raw, pinned)][text...][end-frame image anchor]
+    Dimensions are ALWAYS 0/0 here: every pixel input (anchors, lead) is extracted
+    from the clip itself, so the derived grid IS the clip's grid — no override."""
+    graph = copy.deepcopy(load_template("director"))
+    d_id = next(nid for nid, n in graph.items() if n["class_type"] == "LTXDirector")
+    d = graph[d_id]["inputs"]
+
+    segments = []
+    if lead_video:
+        segments.append({"id": uuid.uuid4().hex[:13] + "_v", "type": "video", "start": 0,
+                         "length": head, "trimStart": 0, "videoDurationFrames": head,
+                         "imageFile": lead_video, "fileName": lead_video.split("/")[-1],
+                         "prompt": "", "fileSize": 0})
+    else:
+        segments.append({"id": uuid.uuid4().hex[:13] + "_i", "type": "image", "start": 0,
+                         "length": 1, "imageFile": start_image,
+                         "fileName": start_image.split("/")[-1], "prompt": "",
+                         "isEndFrame": False})
+    text_total = total - head - 1
+    n_txt = max(1, len(prompts))
+    per = text_total // n_txt
+    pos = head
+    for i, pr in enumerate(prompts):
+        ln = text_total - per * (n_txt - 1) if i == n_txt - 1 else per
+        segments.append({"id": uuid.uuid4().hex[:13], "type": "text", "start": pos,
+                         "length": ln, "prompt": pr["text"], "isEndFrame": False})
+        pos += ln
+    segments.append({"id": uuid.uuid4().hex[:13] + "_e", "type": "image",
+                     "start": total - 1, "length": 1, "imageFile": end_image,
+                     "fileName": end_image.split("/")[-1], "prompt": "",
+                     "isEndFrame": True})
+
+    audio_segments = [{"id": uuid.uuid4().hex[:13] + "_a", "type": "audio", "start": 0,
+                       "length": total, "trimStart": 0, "audioDurationFrames": total,
+                       "audioFile": audio_file, "fileName": audio_file.split("/")[-1],
+                       "waveformPeaks": []}]
+
+    tl = {"mainTrackEnabled": True, "audioTrackEnabled": True, "motionTrackEnabled": True,
+          "propHeight": 90, "globalPropHeight": 60, "showFilenames": True,
+          "overrideAudio": False, "inpaint_audio": False,
+          "global_prompt": global_prompt, "retake_global_prompt": "",
+          "retakeMode": False, "retakeStart": 0, "retakeLength": 0, "retakePrompt": "",
+          "retakeStrength": 1, "retakeVideo": None,
+          "normalStartFrame": 0, "normalDurationFrames": total,
+          "segments": segments, "motionSegments": [], "audioSegments": audio_segments}
+
+    dur = total / fps
+    d.update({
+        "timeline_data": json.dumps(tl),
+        "start_second": 0.0, "end_second": round(dur, 3), "duration_seconds": round(dur, 3),
+        "start_frame": 0, "end_frame": total, "duration_frames": total,
+        "global_prompt": global_prompt,
+        "local_prompts": " | ".join(seg.get("prompt", "") for seg in segments),
+        "segment_lengths": ",".join(str(seg["length"]) for seg in segments),
+        "use_custom_audio": True, "inpaint_audio": False, "override_audio": False,
+        "frame_rate": float(fps), "custom_width": 0, "custom_height": 0,
+        "resize_method": "crop", "display_mode": "seconds",
+    })
+    randomize_seeds(graph)
+    set_filename_prefix(graph, f"ninja/retake_{part_name}")
+    return graph
+
+
+def job_retake_generate(job, host: str, req: dict):
+    """Extract anchors + audio from the clip, generate the window, splice a preview."""
+    sess = retake_session()
+    if not sess.get("clip"):
+        raise DEPS["ToolError"]("Load a clip first")
+    clip = Path(sess["clip"]["path"])
+    fps = int(round(float(sess["clip"]["fps"])))
+    start_sec, end_sec = float(req["start_sec"]), float(req["end_sec"])
+    mode = int(req.get("mode", 1))
+
+    S = int(round(start_sec * fps))
+    E = int(round(end_sec * fps))
+    win = E - S
+    lead = 121 if mode == 2 else 0
+    head = lead if mode == 2 else 1
+    total = head + win + 1
+
+    work = NINJA_DIR / "retake" / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    tag = f"{S}_{E}_{uuid.uuid4().hex[:6]}"
+
+    # 1. anchors + lead + audio, all cut from the clip itself on its true frame grid
+    end_png = work / f"{tag}_end.png"
+    ffmpeg(job, ["-i", str(clip), "-vf", f"select='eq(n\\,{E})'", "-vsync", "0",
+                 "-frames:v", "1", str(end_png)], "extracting end anchor")
+    start_png = lead_mp4 = None
+    if mode == 1:
+        start_png = work / f"{tag}_start.png"
+        ffmpeg(job, ["-i", str(clip), "-vf", f"select='eq(n\\,{max(0, S - 1)})'", "-vsync", "0",
+                     "-frames:v", "1", str(start_png)], "extracting start anchor")
+    else:
+        lead_mp4 = work / f"{tag}_lead.mp4"
+        ffmpeg(job, ["-i", str(clip),
+                     "-vf", f"trim=start_frame={S - lead}:end_frame={S},setpts=PTS-STARTPTS",
+                     "-an", "-c:v", "libx264", "-crf", "12", "-preset", "fast",
+                     str(lead_mp4)], "extracting lead-in video")
+    audio_wav = work / f"{tag}_audio.wav"
+    ffmpeg(job, ["-i", str(clip), "-ss", f"{(S - head) / fps:.6f}", "-to", f"{(E + 1) / fps:.6f}",
+                 "-vn", "-ar", "44100", "-ac", "1", str(audio_wav)], "slicing clip audio")
+    job["progress"] = 0.15
+
+    # 2. upload + generate on the Director host
+    end_up = comfy_upload(host, end_png, end_png.name)
+    start_up = comfy_upload(host, start_png, start_png.name) if start_png else None
+    lead_up = comfy_upload(host, lead_mp4, lead_mp4.name) if lead_mp4 else None
+    audio_up = comfy_upload(host, audio_wav, audio_wav.name)
+    graph = build_retake_graph(
+        prompts=req["prompts"], global_prompt=req.get("global_prompt", ""), fps=fps,
+        total=total, head=head, start_image=start_up, end_image=end_up,
+        lead_video=lead_up, audio_file=audio_up, part_name=tag)
+    run = queue_and_wait(host, graph, job, f"retake {start_sec}-{end_sec}")
+    job["progress"] = 0.75
+    fn, sub = first_video_output(run)
+    raw = work / f"{tag}_raw.mp4"
+    comfy_download(host, fn, sub, raw)
+
+    # 3. patch = generated frames [head, head+win) — boundaries are original frames
+    patch = work / f"{tag}_patch.mp4"
+    ffmpeg(job, ["-i", str(raw),
+                 "-vf", f"trim=start_frame={head}:end_frame={head + win},setpts=PTS-STARTPTS,"
+                        f"scale={sess['clip']['width']}:{sess['clip']['height']}:flags=lanczos",
+                 "-pix_fmt", "yuv420p", "-an", "-r", str(fps),
+                 "-c:v", "libx264", "-crf", "12", "-preset", "fast",
+                 str(patch)], "trimming patch")
+
+    # 4. splice preview: original[0..S) + patch + original[E..), original audio untouched
+    preview = work / f"{tag}_preview.mp4"
+    ffmpeg(job, ["-i", str(clip), "-i", str(patch), "-filter_complex",
+                 f"[0:v]trim=end_frame={S},setpts=PTS-STARTPTS[a];"
+                 f"[1:v]setpts=PTS-STARTPTS[b];"
+                 f"[0:v]trim=start_frame={E},setpts=PTS-STARTPTS[c];"
+                 f"[a][b][c]concat=n=3:v=1:a=0[v]",
+                 "-map", "[v]", "-map", "0:a", "-r", str(fps), "-pix_fmt", "yuv420p",
+                 "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-c:a", "copy",
+                 str(preview)], "splicing preview")
+    job["progress"] = 0.98
+
+    sess["pending"] = {"preview": str(preview), "patch": str(patch), "raw": str(raw),
+                       "start_sec": start_sec, "end_sec": end_sec, "mode": mode,
+                       "request": req, "tag": tag}
+    save_retake_session(sess)
+    return [DEPS["output_entry_abs"](preview, "video",
+                                     f"retake {start_sec:.1f}-{end_sec:.1f} spliced preview")]
 
 
 def job_standalone_upscale(job, host: str, req: dict):
@@ -648,7 +847,8 @@ def register(app, deps: dict):
     @app.get("/api/ninja/state")
     def ninja_state():
         p = project()
-        return {"config": cfg(), "templates": template_status(), "project": p}
+        return {"config": cfg(), "templates": template_status(), "project": p,
+                "retake": retake_session()}
 
     @app.post("/api/ninja/config")
     async def ninja_config(req: dict):
@@ -756,8 +956,12 @@ def register(app, deps: dict):
         p = project()
         if not p["chunks"] or p["chunks"][-1].get("final"):
             raise HTTPException(400, "Nothing to continue — generate first")
-        load_template("upscaler")  # fail fast with a clear message if missing
-        job = DEPS["start_job"]("ninja-continue", job_continue, "upscaler", p)
+        upscale_tail = bool((req or {}).get("upscale_tail", False))
+        if upscale_tail:
+            load_template("upscaler")  # fail fast with a clear message if missing
+        accept = (req or {}).get("accept_sec")
+        job = DEPS["start_job"]("ninja-continue", job_continue, "upscaler", p,
+                                accept, upscale_tail)
         return {"job": job["id"]}
 
     @app.post("/api/ninja/upscale")
@@ -765,6 +969,71 @@ def register(app, deps: dict):
         load_template("upscaler")
         job = DEPS["start_job"]("ninja-upscale", job_standalone_upscale, "upscaler", req)
         return {"job": job["id"]}
+
+    # ---------------- Retake (clip window patching) ----------------
+
+    @app.post("/api/ninja/retake_clip/upload")
+    async def retake_upload(file: UploadFile = File(...)):
+        rt_dir = NINJA_DIR / "retake"
+        rt_dir.mkdir(parents=True, exist_ok=True)
+        dest = rt_dir / (uuid.uuid4().hex[:8] + Path(file.filename or "clip.mp4").suffix)
+        dest.write_bytes(await file.read())
+        info = DEPS["ffprobe"](dest)
+        v = next((st for st in info.get("streams", []) if st.get("codec_type") == "video"), None)
+        if not v:
+            raise HTTPException(400, "No video stream in file")
+        num, _, den = (v.get("avg_frame_rate") or "24/1").partition("/")
+        fps = float(num) / float(den or 1)
+        dur = float(info.get("format", {}).get("duration") or 0)
+        clip = {"path": str(dest), "filename": file.filename, "duration": round(dur, 3),
+                "fps": round(fps, 3), "width": v.get("width"), "height": v.get("height"),
+                "frames": int(v.get("nb_frames") or round(dur * fps))}
+        save_retake_session({"clip": clip, "pending": None})
+        return clip
+
+    @app.post("/api/ninja/retake_clip/generate")
+    async def retake_generate(req: dict):
+        sess = retake_session()
+        if not sess.get("clip"):
+            raise HTTPException(400, "Upload a clip first")
+        if not req.get("prompts"):
+            raise HTTPException(400, "At least one text prompt segment required")
+        load_template("director")
+        start_sec, end_sec = float(req.get("start_sec", -1)), float(req.get("end_sec", -1))
+        win = end_sec - start_sec
+        clip = sess["clip"]
+        fps = float(clip["fps"])
+        if not (RETAKE_MIN_S <= win <= RETAKE_MAX_S):
+            raise HTTPException(400, f"Window must be {RETAKE_MIN_S:.0f}-{RETAKE_MAX_S:.0f}s (got {win:.1f}s)")
+        if start_sec < 0 or end_sec > float(clip["duration"]) - 0.5:
+            raise HTTPException(400, "Window must be inside the clip (and end ≥0.5s before its end)")
+        if int(req.get("mode", 1)) == 2 and start_sec * fps < 121:
+            raise HTTPException(400, "Mode 2 needs ≥5s of video before the window — use mode 1 here")
+        job = DEPS["start_job"]("ninja-retake-clip", job_retake_generate, "director", req)
+        return {"job": job["id"]}
+
+    @app.post("/api/ninja/retake_clip/apply")
+    def retake_apply():
+        sess = retake_session()
+        pend = sess.get("pending")
+        if not pend:
+            raise HTTPException(400, "Nothing to apply — generate a retake first")
+        clip = Path(sess["clip"]["path"])
+        out = clip.with_name(clip.stem + f"_retake_{pend['tag'][:6]}.mp4")
+        Path(pend["preview"]).replace(out)
+        # the patched clip becomes the session clip, so retakes can be chained
+        sess["clip"]["path"] = str(out)
+        sess["clip"]["filename"] = out.name
+        sess["pending"] = None
+        save_retake_session(sess)
+        return {"ok": True, "path": str(out)}
+
+    @app.post("/api/ninja/retake_clip/discard")
+    def retake_discard():
+        sess = retake_session()
+        sess["pending"] = None
+        save_retake_session(sess)
+        return {"ok": True}
 
     @app.get("/api/ninja/file")
     def ninja_file(path: str):

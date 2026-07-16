@@ -18,13 +18,14 @@
   ["#tab-studio", "#tab-tools"].forEach(sel =>
     $n(sel).addEventListener("click", () => { $n("#ninja").hidden = true; }));
 
-  $n("#nj-tab-director").addEventListener("click", () => switchNinjaTab("director"));
-  $n("#nj-tab-upscaler").addEventListener("click", () => switchNinjaTab("upscaler"));
-  $n("#nj-tab-settings").addEventListener("click", () => switchNinjaTab("settings"));
+  const NJ_SECTIONS = { director: "#nj-director", upscaler: "#nj-upscaler",
+                        retake: "#nj-retake-tab", settings: "#nj-settings" };
+  Object.keys(NJ_SECTIONS).forEach(x =>
+    $n(`#nj-tab-${x}`).addEventListener("click", () => switchNinjaTab(x)));
   function switchNinjaTab(t) {
-    ["director", "upscaler", "settings"].forEach(x => {
+    Object.entries(NJ_SECTIONS).forEach(([x, sel]) => {
       $n(`#nj-tab-${x}`).classList.toggle("active", x === t);
-      $n(`#nj-${x}`).hidden = x !== t;
+      $n(sel).hidden = x !== t;
     });
   }
 
@@ -34,6 +35,7 @@
       ninjaState = await apiJSON("/api/ninja/state");
       renderSettings();
       renderDirector();
+      renderRetake();
     } catch (e) {
       const stale = /Method Not Allowed|Not Found/i.test(e.message);
       toast(stale
@@ -114,9 +116,17 @@
     if ($n("#nj-gen-h").value === "") $n("#nj-gen-h").value = ninjaState.config.settings.height;
     const tail = p.pending_tail;
     $n("#nj-tail-info").textContent = tail
-      ? `pinned start: upscaled 5s tail from ${tail.from_chunk}`
-      : "first chunk — starts from image (optional) or pure text";
-    $n("#nj-img-row").style.display = tail ? "none" : "flex";
+      ? `tail available from ${tail.from_chunk} (${(tail.seconds || 0).toFixed(2)}s)`
+      : "no tail yet — first chunk or after reset";
+    const srcSel = $n("#nj-source");
+    srcSel.querySelector('option[value="extend"]').disabled = !tail;
+    if (!tail) {
+      srcSel.value = "new";               // nothing to extend from
+      srcSel.dataset.userTouched = "";    // forget stale user choice
+    } else if (srcSel.dataset.userTouched !== "1") {
+      srcSel.value = "extend";            // tail exists -> extending is the default
+    }
+    updateSourceUI();
 
     const list = $n("#nj-parts");
     list.innerHTML = "";
@@ -143,6 +153,7 @@
       $n("#nj-retake").style.display = imported ? "none" : "";
       $n("#nj-retake-len").style.display = imported ? "none" : "";
       $n("#nj-retake-len").value = (last.to - last.from).toFixed(1);
+      $n("#nj-accept-len").value = (last.to - last.from).toFixed(1);
       $n("#nj-review-title").textContent = imported
         ? `${last.part} (imported) — press Continue to prep its tail`
         : (last.preview
@@ -179,6 +190,15 @@
       refreshState();
     } catch (err) { toast(err.message, true); }
     e.target.value = "";
+  });
+
+  function updateSourceUI() {
+    // image start only makes sense for a fresh scene; extend pins the tail video
+    $n("#nj-img-row").style.display = $n("#nj-source").value === "new" ? "flex" : "none";
+  }
+  $n("#nj-source").addEventListener("change", () => {
+    $n("#nj-source").dataset.userTouched = "1";
+    updateSourceUI();
   });
 
   $n("#nj-add-prompt").addEventListener("click", addPrompt);
@@ -220,9 +240,10 @@
       global_prompt: $n("#nj-global").value.trim(),
       width: +$n("#nj-gen-w").value || 0,
       height: +$n("#nj-gen-h").value || 0,
+      source: $n("#nj-source").value,
     };
     const imgInput = $n("#nj-img-file");
-    if (!ninjaState.project.pending_tail && imgInput.files[0]) {
+    if ($n("#nj-source").value === "new" && imgInput.files[0]) {
       const fd = new FormData();
       fd.append("file", imgInput.files[0]);
       const asset = await apiJSON("/api/upload", { method: "POST", body: fd });
@@ -239,13 +260,106 @@
   });
 
   $n("#nj-continue").addEventListener("click", async () => {
-    try { await runJob("/api/ninja/continue", {}, "Continue (finalize + tail upscale)"); }
+    const acc = +$n("#nj-accept-len").value;
+    const body = { upscale_tail: $n("#nj-tail-upscale").checked };
+    if (acc > 0) body.accept_sec = acc;
+    try { await runJob("/api/ninja/continue", body, "Continue (finalize + prep tail)"); }
     catch (e) { toast(e.message, true); }
   });
 
   $n("#nj-reset").addEventListener("click", async () => {
     if (!confirm("Reset project? Finished part files stay on disk.")) return;
     await apiJSON("/api/ninja/reset", { method: "POST" });
+    refreshState();
+  });
+
+  /* ---------- retake tab (clip window patching) ---------- */
+  let rtPromptCount = 0;
+
+  function renderRetake() {
+    const rt = ninjaState.retake || {};
+    const info = $n("#nj-rt-info");
+    if (rt.clip) {
+      info.textContent = `🎞 ${rt.clip.filename} — ${fmtSec(rt.clip.duration)} | ` +
+        `${rt.clip.width}×${rt.clip.height} @ ${rt.clip.fps}fps`;
+    } else {
+      info.textContent = "No clip loaded.";
+    }
+    const pend = rt.pending;
+    $n("#nj-rt-review").hidden = !pend;
+    if (pend) {
+      const v = $n("#nj-rt-video");
+      if (!v.src.includes(encodeURIComponent(pend.preview))) {
+        v.src = "/api/ninja/file?path=" + encodeURIComponent(pend.preview);
+        v.addEventListener("loadedmetadata", () => {
+          v.currentTime = Math.max(0, pend.start_sec - 3);  // land just before the patch
+        }, { once: true });
+      }
+      $n("#nj-rt-review-title").textContent =
+        `Spliced preview — patch at ${pend.start_sec.toFixed(1)}–${pend.end_sec.toFixed(1)}s (mode ${pend.mode})`;
+    }
+    if (rtPromptCount === 0) rtAddPrompt();
+  }
+
+  $n("#nj-rt-add-prompt").addEventListener("click", rtAddPrompt);
+  function rtAddPrompt() {
+    rtPromptCount++;
+    const wrap = document.createElement("div");
+    wrap.className = "nj-prompt";
+    wrap.innerHTML = `<span class="nj-prompt-n">[txt]</span>
+      <textarea rows="2" placeholder="what happens in the retaken window…"></textarea>
+      <button class="btn-small nj-del">✕</button>`;
+    wrap.querySelector(".nj-del").addEventListener("click", () => { wrap.remove(); rtPromptCount--; });
+    $n("#nj-rt-prompts").appendChild(wrap);
+  }
+
+  $n("#nj-rt-file").addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const fd = new FormData();
+    fd.append("file", f);
+    try {
+      await apiJSON("/api/ninja/retake_clip/upload", { method: "POST", body: fd });
+      toast("Clip loaded");
+      refreshState();
+    } catch (err) { toast(err.message, true); }
+    e.target.value = "";
+  });
+
+  async function rtGenerate(body) {
+    try { await runJob("/api/ninja/retake_clip/generate", body, "Retake window"); }
+    catch (e) { toast(e.message, true); }
+  }
+
+  $n("#nj-rt-generate").addEventListener("click", () => {
+    const prompts = [...document.querySelectorAll("#nj-rt-prompts textarea")]
+      .map(t => ({ text: t.value.trim() })).filter(p => p.text);
+    if (!prompts.length) return toast("Write at least one prompt", true);
+    rtGenerate({
+      start_sec: +$n("#nj-rt-from").value,
+      end_sec: +$n("#nj-rt-to").value,
+      mode: +$n("#nj-rt-mode").value,
+      prompts,
+      global_prompt: $n("#nj-rt-global").value.trim(),
+    });
+  });
+
+  $n("#nj-rt-again").addEventListener("click", () => {
+    const pend = (ninjaState.retake || {}).pending;
+    if (!pend) return;
+    rtGenerate(pend.request);  // same request, new seed
+  });
+
+  $n("#nj-rt-apply").addEventListener("click", async () => {
+    try {
+      const r = await apiJSON("/api/ninja/retake_clip/apply", { method: "POST" });
+      toast("Applied → " + r.path);
+      refreshState();
+    } catch (e) { toast(e.message, true); }
+  });
+
+  $n("#nj-rt-discard").addEventListener("click", async () => {
+    await apiJSON("/api/ninja/retake_clip/discard", { method: "POST" });
     refreshState();
   });
 
