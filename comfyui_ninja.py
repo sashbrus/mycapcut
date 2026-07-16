@@ -51,6 +51,10 @@ DEFAULT_CFG = {
     },
 }
 
+# TEMP switch (user request 2026-07-15): tail upscale disabled for fast testing
+# of the dimension fix. Set back to True to restore the quality-refresh step.
+TAIL_UPSCALE = False
+
 # node classes that identify a template kind
 KIND_MARKERS = {"director": "LTXDirector", "upscaler": "RTXVideoSuperResolution"}
 
@@ -412,10 +416,23 @@ def job_generate(job, host: str, p: dict, req: dict):
         image_file = comfy_upload(host, a, a.name)
     job["progress"] = 0.2
 
-    # per-run dimension override from the Director tab; falls back to Settings.
-    # 0/0 = derive from the first segment (part1's grid) — the recommended default.
-    width = int(req["width"]) if req.get("width") is not None else int(s["width"])
-    height = int(req["height"]) if req.get("height") is not None else int(s["height"])
+    # Dimensions law: extensions ALWAYS use part1's ACTUAL dimensions, explicitly
+    # (measured from the first part's file — never user fields, never node defaults).
+    if tail:
+        if not p.get("work_resolution"):
+            finfo = DEPS["ffprobe"](Path(p["chunks"][0]["raw"]))
+            fst = next((st for st in finfo.get("streams", []) if st.get("codec_type") == "video"), {})
+            p["work_resolution"] = {"w": int(fst.get("width", 0)), "h": int(fst.get("height", 0))}
+            save_project(p)
+        width = int(p["work_resolution"]["w"])
+        height = int(p["work_resolution"]["h"])
+    else:
+        width = int(req["width"]) if req.get("width") is not None else int(s["width"])
+        height = int(req["height"]) if req.get("height") is not None else int(s["height"])
+        # the node snaps to /32 silently (720 -> 704) which desyncs the project
+        # grid — snap up-front so what you ask for is what everything else sees
+        width -= width % 32
+        height -= height % 32
     graph = build_director_graph(
         host, prompts=req["prompts"], from_sec=from_sec, to_sec=to_sec, fps=fps,
         width=width, height=height, tail_file=tail_file,
@@ -525,24 +542,32 @@ def job_continue(job, host: str, p: dict):
                  str(tail_cut)], "cutting tail")
     job["progress"] = 0.3
 
-    tail_file = comfy_upload(host, tail_cut, tail_cut.name)
-    graph = build_upscale_graph(host, video_file=tail_file, anchor_file=None,
-                                denoise=float(s["tail_upscale_denoise"]),
-                                multiplier=float(s["tail_upscale_multiplier"]),
-                                part_name=chunk["part"])
-    run = queue_and_wait(host, graph, job, f"{chunk['part']} tail upscale")
-    job["progress"] = 0.8
-    fn, sub = first_video_output(run)
-    tail_up_big = work / f"{chunk['part']}_tail_up_big.mp4"
-    comfy_download(host, fn, sub, tail_up_big)
+    if TAIL_UPSCALE:
+        tail_file = comfy_upload(host, tail_cut, tail_cut.name)
+        graph = build_upscale_graph(host, video_file=tail_file, anchor_file=None,
+                                    denoise=float(s["tail_upscale_denoise"]),
+                                    multiplier=float(s["tail_upscale_multiplier"]),
+                                    part_name=chunk["part"])
+        run = queue_and_wait(host, graph, job, f"{chunk['part']} tail upscale")
+        job["progress"] = 0.8
+        fn, sub = first_video_output(run)
+        tail_up_big = work / f"{chunk['part']}_tail_up_big.mp4"
+        comfy_download(host, fn, sub, tail_up_big)
 
-    # MANDATORY downscale back to the project resolution (part1's grid) — the
-    # upscaled tail must re-enter the Director at exactly the working size
-    wr = p["work_resolution"]
-    tail_up = work / f"{chunk['part']}_tail_up.mp4"
-    ffmpeg(job, ["-i", str(tail_up_big), "-vf", f"scale={wr['w']}:{wr['h']}:flags=lanczos",
-                 "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-c:a", "aac",
-                 str(tail_up)], "downscaling tail back to project resolution")
+        # downscale back to the project resolution (part1's grid) — the upscaled
+        # tail must re-enter the Director at exactly the working size
+        wr = p["work_resolution"]
+        tail_up = work / f"{chunk['part']}_tail_up.mp4"
+        ffmpeg(job, ["-i", str(tail_up_big), "-vf", f"scale={wr['w']}:{wr['h']}:flags=lanczos",
+                     "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-c:a", "aac",
+                     str(tail_up)], "downscaling tail back to project resolution")
+    else:
+        # TEMP: tail upscale OFF for fast dimension testing (user request 2026-07-15)
+        wr = p["work_resolution"]
+        tail_up = work / f"{chunk['part']}_tail_raw.mp4"
+        ffmpeg(job, ["-i", str(tail_cut), "-vf", f"scale={wr['w']}:{wr['h']}:flags=lanczos",
+                     "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-c:a", "aac",
+                     str(tail_up)], "normalizing raw tail (upscale disabled)")
 
     # measure the ACTUAL frame count (upscaler snaps to 8n+1) — the next chunk's
     # timeline and audio slice must use this exact length
@@ -658,6 +683,7 @@ def register(app, deps: dict):
                      "duration": media_duration(dest)}
         p["chunks"], p["next_start"] = [], 0.0
         p.pop("pending_tail", None)
+        p.pop("work_resolution", None)  # new project = new grid, from ITS part1
         save_project(p)
         return p
 
@@ -695,6 +721,7 @@ def register(app, deps: dict):
         p = project()
         p["chunks"], p["next_start"] = [], 0.0
         p.pop("pending_tail", None)
+        p.pop("work_resolution", None)  # new project = new grid, from ITS part1
         save_project(p)
         return p
 
