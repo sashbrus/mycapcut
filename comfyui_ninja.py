@@ -361,13 +361,11 @@ def build_director_graph(host: str, *, prompts: list, from_sec: float, to_sec: f
                          "length": ln, "prompt": p["text"], "isEndFrame": False})
         text_start += ln
     if end_image_file:
-        # the end keyframe sits IMMEDIATELY after the last regenerated frame —
-        # a 1-frame segment, so wherever the node pins it (segment start or
-        # end) it lands exactly at the window boundary. The rest of the end
-        # zone becomes trailing text padding AFTER the keyframe: it keeps the
-        # 8n+1 grid, is generated past the landing point and trimmed away.
-        # Before this, the keyframe sat at the far end of the padding, so the
-        # last kept frame was still mid-flight toward it (visible end jump).
+        # img2 = ONE-frame keyframe exactly at the window end. Proven both
+        # ways: a long isEndFrame segment makes the model settle onto the
+        # image ~10 frames EARLY (frozen dupes at the end of the window);
+        # the 1-frame pin + trailing text keeps it moving right up to the
+        # landing point. The trailing region is trimmed away.
         segments.append({
             "id": uuid.uuid4().hex[:13] + "_e", "type": "image",
             "start": text_start, "length": 1,
@@ -731,19 +729,16 @@ def job_retake_generate(job, host: str, req: dict):
     S = int(round(start_sec * fps))
     E = int(round(end_sec * fps))
     win = E - S
-    lead = 121 if mode == 2 else 0        # same 121-frame tail as the Director loop
-    if mode == 1 and S < 1:
-        raise DEPS["ToolError"]("Mode 1 needs at least 1 frame before the window "
-                                "(the start anchor is the frame just BEFORE it)")
-    img_frames = min(6, S) if mode == 1 else 0   # start-image zone, trimmed like the lead
-    head = lead if mode == 2 else img_frames
-    # the head/end zones are trimmed away afterwards — pad the END zone so the
-    # TOTAL lands exactly on the LTX frame grid (8n+1). Otherwise the node
-    # silently resizes to the nearest 8n+1 and every boundary drifts 2-3 frames.
-    # (the end keyframe itself occupies only the FIRST frame of this zone —
-    # right after the last regenerated frame; the rest is trailing padding)
-    end_frames = 6 + (1 - (head + win + 6)) % 8  # end zone (trimmed away)
-    total = head + win + end_frames              # always 8n+1
+    # THE MANUAL RECIPE, coded 1:1. Anchors are the original frames AT S and
+    # AT E. Timeline: [img1 pinned at 0][txt up to the window end][img2 starting
+    # exactly at the window end]. Keep [head, head+win): the pin copy of frame S
+    # plus win-1 new frames, landing directly on img2's pin (= original frame E).
+    lead = 121 if mode == 2 else 0        # mode 2 lead video ends WITH frame S
+    head = lead - 1 if mode == 2 else 0   # first kept frame = the copy of frame S
+    img_frames = fps if mode == 1 else 0  # img1 zone ~1s; only its pin (0) matters
+    pin2 = head + win                     # img2 starts exactly at the window end
+    total = ((pin2 + fps) // 8) * 8 + 1   # img2 zone ~1s, on the LTX 8n+1 grid
+    end_frames = total - pin2             # img2 segment length (never kept)
 
     work = NINJA_DIR / "retake" / "work"
     work.mkdir(parents=True, exist_ok=True)
@@ -757,29 +752,25 @@ def job_retake_generate(job, host: str, req: dict):
     start_png = lead_mp4 = None
     if mode == 1:
         start_png = work / f"{tag}_start.png"
-        # anchor = the frame just BEFORE the window: every frame of [S, E) gets
-        # regenerated; frame S-1 is the last original frame we continue from
-        ffmpeg(job, ["-i", str(clip), "-vf", f"select='eq(n\\,{S - 1})'", "-vsync", "0",
+        # anchor = the original frame AT the window start (the manual recipe) —
+        # its pin copy is the first kept frame, so the seam frame IS original
+        ffmpeg(job, ["-i", str(clip), "-vf", f"select='eq(n\\,{S})'", "-vsync", "0",
                      "-frames:v", "1", str(start_png)], "extracting start anchor")
-        _guard_black_anchor(start_png, "Start ('From')", (S - 1) / fps)
+        _guard_black_anchor(start_png, "Start ('From')", start_sec)
     else:
+        # lead ends WITH frame S: its last frame is the original window-start
+        # frame, and it is the first kept frame of the patch
         lead_mp4 = work / f"{tag}_lead.mp4"
         ffmpeg(job, ["-i", str(clip),
-                     "-vf", f"trim=start_frame={S - lead}:end_frame={S},setpts=PTS-STARTPTS",
+                     "-vf", f"trim=start_frame={S - lead + 1}:end_frame={S + 1},setpts=PTS-STARTPTS",
                      "-an", "-c:v", "libx264", "-crf", "12", "-preset", "fast",
                      str(lead_mp4)], "extracting lead-in video")
-    # audio, the UI pattern: the lead video brings ITS OWN correlated audio;
-    # the new slice covers ONLY the regenerated window (+ end zone)
+    # audio = the manual recipe: ONE slice of the clip's own audio laid at 0 —
+    # timeline frame k plays the audio of clip frame (S - head) + k, exactly
     win_wav = work / f"{tag}_audio_win.wav"
-    win_wav_from = S if mode == 2 else S - img_frames   # mode 1: cover the image zone
-    ffmpeg(job, ["-i", str(clip), "-ss", f"{win_wav_from / fps:.6f}",
-                 "-to", f"{(E + end_frames) / fps:.6f}",
+    ffmpeg(job, ["-i", str(clip), "-ss", f"{(S - head) / fps:.6f}",
+                 "-to", f"{E / fps:.6f}",
                  "-vn", "-ar", "44100", "-ac", "1", str(win_wav)], "slicing window audio")
-    lead_wav = None
-    if lead:
-        lead_wav = work / f"{tag}_audio_lead.wav"
-        ffmpeg(job, ["-i", str(clip), "-ss", f"{(S - lead) / fps:.6f}", "-to", f"{S / fps:.6f}",
-                     "-vn", "-ar", "44100", "-ac", "1", str(lead_wav)], "slicing lead audio")
     job["progress"] = 0.15
 
     # 2. upload + generate on the Director host — THE SAME BUILDER AS PARTS
@@ -787,10 +778,7 @@ def job_retake_generate(job, host: str, req: dict):
     start_up = comfy_upload(host, start_png, start_png.name) if start_png else None
     lead_up = comfy_upload(host, lead_mp4, lead_mp4.name) if lead_mp4 else None
     win_wav_up = comfy_upload(host, win_wav, win_wav.name)
-    tracks = [(win_wav_up, 0, img_frames + win + end_frames)]
-    if lead_wav:
-        lead_wav_up = comfy_upload(host, lead_wav, lead_wav.name)
-        tracks = [(lead_wav_up, 0, lead), (win_wav_up, lead, win + end_frames)]
+    tracks = [(win_wav_up, 0, head + win)]
     graph = build_director_graph(
         host, prompts=req["prompts"],
         from_sec=start_sec, to_sec=end_sec + end_frames / fps, fps=fps,
@@ -817,27 +805,24 @@ def job_retake_generate(job, host: str, req: dict):
             f"Director returned {raw_frames} frames, expected {total} — the patch "
             f"would be shifted. Aborting instead of splicing misaligned frames.")
 
-    # 3. patch = generated frames [head, head+win) — exactly `win` new frames,
-    # the head zone (lead video / start image) is trimmed away like in parts.
-    # Luma fix: the LTX VAE decode shifts brightness (~2-3 units darker) on
-    # everything it outputs. Measure the shift on frames whose content is
-    # KNOWN — the end keyframe IS original frame E (pinned at the last frame
-    # of the end zone); the start zone reproduces the start anchor / lead
-    # video — and correct the patch by that offset.
-    kf = head + win  # end keyframe position in the generation
+    # 3. patch = generated frames [head, head+win) — exactly `win` frames: the
+    # pin copy of frame S first, then the new frames, ending adjacent to img2's
+    # pin. Luma fix: the LTX VAE decode shifts brightness (~2-3 units darker)
+    # on everything it outputs. Measure the shift on frames whose content is
+    # KNOWN — both pins are exact original frames — and correct the patch.
     samples = []
     o = _yavg(clip, E, E + 1)
-    g = _yavg(raw, kf, kf + 1)
+    g = _yavg(raw, pin2, pin2 + 1)   # img2 pin = original frame E
     if o and g:
         samples.append(o[0] - g[0])
-    if mode == 1 and img_frames:
-        o = _yavg(clip, S - 1, S)
-        g = _yavg(raw, img_frames // 2, img_frames // 2 + 1)
+    if mode == 1:
+        o = _yavg(clip, S, S + 1)
+        g = _yavg(raw, 0, 1)         # img1 pin = original frame S
         if o and g:
             samples.append(o[0] - g[0])
-    elif mode == 2:
-        o = _yavg(clip, S - lead, S - lead + 5)
-        g = _yavg(raw, 0, 5)
+    else:
+        o = _yavg(clip, S - head, S - head + 5)
+        g = _yavg(raw, 0, 5)         # lead video start reproduces the clip
         if o and g and len(o) == len(g):
             samples.append(sum(a - b for a, b in zip(o, g)) / len(o))
     offset = max(-8.0, min(8.0, sum(samples) / len(samples))) if samples else 0.0
