@@ -331,13 +331,28 @@
     catch (e) { toast(e.message, true); }
   }
 
+  // parse "82", "1:22", "00:01:22" or "00:01:22:12" (last part = frames at clip fps)
+  function parseTimecode(str) {
+    const parts = String(str).trim().split(":").map(x => x.trim());
+    if (parts.some(x => x === "" || isNaN(+x))) return NaN;
+    const fps = ((ninjaState.retake || {}).clip || {}).fps || 24;
+    if (parts.length === 1) return +parts[0];                                  // seconds
+    if (parts.length === 2) return +parts[0] * 60 + +parts[1];                 // m:ss
+    if (parts.length === 3) return +parts[0] * 3600 + +parts[1] * 60 + +parts[2];  // h:mm:ss
+    if (parts.length === 4) return +parts[0] * 3600 + +parts[1] * 60 + +parts[2] + (+parts[3]) / fps;
+    return NaN;
+  }
+
   $n("#nj-rt-generate").addEventListener("click", () => {
     const prompts = [...document.querySelectorAll("#nj-rt-prompts textarea")]
       .map(t => ({ text: t.value.trim() })).filter(p => p.text);
     if (!prompts.length) return toast("Write at least one prompt", true);
+    const from = parseTimecode($n("#nj-rt-from").value);
+    const to = parseTimecode($n("#nj-rt-to").value);
+    if (isNaN(from) || isNaN(to)) return toast("Bad time format — use 00:01:22 or 82 (s)", true);
     rtGenerate({
-      start_sec: +$n("#nj-rt-from").value,
-      end_sec: +$n("#nj-rt-to").value,
+      start_sec: from,
+      end_sec: to,
       mode: +$n("#nj-rt-mode").value,
       prompts,
       global_prompt: $n("#nj-rt-global").value.trim(),

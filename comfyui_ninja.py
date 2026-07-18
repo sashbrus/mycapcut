@@ -284,19 +284,26 @@ def set_filename_prefix(graph: dict, prefix: str):
 def build_director_graph(host: str, *, prompts: list, from_sec: float, to_sec: float,
                          fps: int, width: int, height: int, tail_file: str | None,
                          tail_seconds: float, image_file: str | None,
-                         global_prompt: str, part_name: str, song_file: str) -> dict:
+                         global_prompt: str, part_name: str, song_file: str,
+                         end_image_file: str | None = None,
+                         audio_tracks: list | None = None,
+                         end_zone_frames: int = 6,
+                         image_zone_frames: int | None = None,
+                         total_frames: int | None = None) -> dict:
     """Build a Director graph for one chunk.
 
     Timeline (all in frames, starting at 0):
       [tail video (tail_seconds)] or [image] or nothing
       [text prompt segments...] filling the rest
+      [end-frame image] (optional, 6 frames, isEndFrame — native node feature)
       audio: one segment = song slice covering the whole window.
     """
     graph = copy.deepcopy(load_template("director"))
     d_id = next(nid for nid, n in graph.items() if n["class_type"] == "LTXDirector")
     d = graph[d_id]["inputs"]
 
-    total_frames = int(round((to_sec - from_sec + (tail_seconds if tail_file else 0)) * fps))
+    if total_frames is None:
+        total_frames = int(round((to_sec - from_sec + (tail_seconds if tail_file else 0)) * fps))
     tail_frames = int(round(tail_seconds * fps)) if tail_file else 0
 
     segments = []
@@ -308,16 +315,19 @@ def build_director_graph(host: str, *, prompts: list, from_sec: float, to_sec: f
             "prompt": "", "fileSize": 0,
         })
     elif image_file:
-        img_frames = int(round(prompts[0].get("image_seconds", 0.25) * fps)) or 6
+        img_frames = image_zone_frames or int(round(prompts[0].get("image_seconds", 0.25) * fps)) or 6
         segments.append({
             "id": uuid.uuid4().hex[:13] + "_i", "type": "image", "start": 0,
             "length": img_frames, "imageFile": image_file,
             "fileName": image_file.split("/")[-1], "prompt": "", "isEndFrame": False,
         })
 
-    used = sum(s["length"] for s in segments if s["type"] == "video")
+    # head = everything already placed (video tail OR start image) — text begins
+    # AFTER it, like in the real Director UI (overlap = broken prompt mapping)
+    used = sum(s["length"] for s in segments)
+    end_frames = end_zone_frames if end_image_file else 0
     text_start = used
-    text_total = total_frames - text_start
+    text_total = total_frames - text_start - end_frames
     n_txt = max(1, len(prompts))
     per = text_total // n_txt
     for i, p in enumerate(prompts):
@@ -325,12 +335,28 @@ def build_director_graph(host: str, *, prompts: list, from_sec: float, to_sec: f
         segments.append({"id": uuid.uuid4().hex[:13], "type": "text", "start": text_start,
                          "length": ln, "prompt": p["text"], "isEndFrame": False})
         text_start += ln
+    if end_image_file:
+        segments.append({
+            "id": uuid.uuid4().hex[:13] + "_e", "type": "image",
+            "start": total_frames - end_frames, "length": end_frames,
+            "imageFile": end_image_file, "fileName": end_image_file.split("/")[-1],
+            "prompt": "", "isEndFrame": True,
+        })
 
-    audio_segments = [{
-        "id": uuid.uuid4().hex[:13] + "_a", "type": "audio", "start": 0,
-        "length": total_frames, "trimStart": 0, "audioDurationFrames": total_frames,
-        "audioFile": song_file, "fileName": song_file.split("/")[-1], "waveformPeaks": [],
-    }]
+    if audio_tracks:
+        # explicit audio layout: list of (file, start_frame, num_frames) — the UI
+        # pattern: video segment's own audio first, then the new-range slice
+        audio_segments = [{
+            "id": uuid.uuid4().hex[:13] + f"_a{i}", "type": "audio", "start": int(st),
+            "length": int(ln), "trimStart": 0, "audioDurationFrames": int(ln),
+            "audioFile": f, "fileName": f.split("/")[-1], "waveformPeaks": [],
+        } for i, (f, st, ln) in enumerate(audio_tracks)]
+    else:
+        audio_segments = [{
+            "id": uuid.uuid4().hex[:13] + "_a", "type": "audio", "start": 0,
+            "length": total_frames, "trimStart": 0, "audioDurationFrames": total_frames,
+            "audioFile": song_file, "fileName": song_file.split("/")[-1], "waveformPeaks": [],
+        }]
 
     tl = {
         "mainTrackEnabled": True, "audioTrackEnabled": True, "motionTrackEnabled": True,
@@ -634,76 +660,27 @@ def save_retake_session(sess: dict):
     _save_json(retake_session_file(), sess)
 
 
-def build_retake_graph(*, prompts: list, global_prompt: str, fps: int, total: int,
-                       head: int, start_image: str | None, end_image: str,
-                       lead_video: str | None, audio_file: str, part_name: str) -> dict:
-    """Director graph for a window patch:
-    mode 1: [start-frame image anchor][text...][end-frame image anchor]
-    mode 2: [lead-in video (raw, pinned)][text...][end-frame image anchor]
-    Dimensions are ALWAYS 0/0 here: every pixel input (anchors, lead) is extracted
-    from the clip itself, so the derived grid IS the clip's grid — no override."""
-    graph = copy.deepcopy(load_template("director"))
-    d_id = next(nid for nid, n in graph.items() if n["class_type"] == "LTXDirector")
-    d = graph[d_id]["inputs"]
-
-    segments = []
-    if lead_video:
-        segments.append({"id": uuid.uuid4().hex[:13] + "_v", "type": "video", "start": 0,
-                         "length": head, "trimStart": 0, "videoDurationFrames": head,
-                         "imageFile": lead_video, "fileName": lead_video.split("/")[-1],
-                         "prompt": "", "fileSize": 0})
-    else:
-        segments.append({"id": uuid.uuid4().hex[:13] + "_i", "type": "image", "start": 0,
-                         "length": 1, "imageFile": start_image,
-                         "fileName": start_image.split("/")[-1], "prompt": "",
-                         "isEndFrame": False})
-    text_total = total - head - 1
-    n_txt = max(1, len(prompts))
-    per = text_total // n_txt
-    pos = head
-    for i, pr in enumerate(prompts):
-        ln = text_total - per * (n_txt - 1) if i == n_txt - 1 else per
-        segments.append({"id": uuid.uuid4().hex[:13], "type": "text", "start": pos,
-                         "length": ln, "prompt": pr["text"], "isEndFrame": False})
-        pos += ln
-    segments.append({"id": uuid.uuid4().hex[:13] + "_e", "type": "image",
-                     "start": total - 1, "length": 1, "imageFile": end_image,
-                     "fileName": end_image.split("/")[-1], "prompt": "",
-                     "isEndFrame": True})
-
-    audio_segments = [{"id": uuid.uuid4().hex[:13] + "_a", "type": "audio", "start": 0,
-                       "length": total, "trimStart": 0, "audioDurationFrames": total,
-                       "audioFile": audio_file, "fileName": audio_file.split("/")[-1],
-                       "waveformPeaks": []}]
-
-    tl = {"mainTrackEnabled": True, "audioTrackEnabled": True, "motionTrackEnabled": True,
-          "propHeight": 90, "globalPropHeight": 60, "showFilenames": True,
-          "overrideAudio": False, "inpaint_audio": False,
-          "global_prompt": global_prompt, "retake_global_prompt": "",
-          "retakeMode": False, "retakeStart": 0, "retakeLength": 0, "retakePrompt": "",
-          "retakeStrength": 1, "retakeVideo": None,
-          "normalStartFrame": 0, "normalDurationFrames": total,
-          "segments": segments, "motionSegments": [], "audioSegments": audio_segments}
-
-    dur = total / fps
-    d.update({
-        "timeline_data": json.dumps(tl),
-        "start_second": 0.0, "end_second": round(dur, 3), "duration_seconds": round(dur, 3),
-        "start_frame": 0, "end_frame": total, "duration_frames": total,
-        "global_prompt": global_prompt,
-        "local_prompts": " | ".join(seg.get("prompt", "") for seg in segments),
-        "segment_lengths": ",".join(str(seg["length"]) for seg in segments),
-        "use_custom_audio": True, "inpaint_audio": False, "override_audio": False,
-        "frame_rate": float(fps), "custom_width": 0, "custom_height": 0,
-        "resize_method": "crop", "display_mode": "seconds",
-    })
-    randomize_seeds(graph)
-    set_filename_prefix(graph, f"ninja/retake_{part_name}")
-    return graph
+def _guard_black_anchor(png: Path, label: str, at_sec: float):
+    """A black anchor frame forces the model to fade the whole window to black —
+    refuse loudly instead of generating a doomed run."""
+    try:
+        from PIL import Image as _Img
+        import numpy as _np
+        b = float(_np.array(_Img.open(png).convert("L")).mean())
+    except Exception:
+        return  # can't measure — don't block
+    if b < 5.0:
+        raise DEPS["ToolError"](
+            f"{label} anchor at {at_sec:.2f}s is a BLACK frame (brightness {b:.1f}). "
+            f"The model would fade the window into black. Move that boundary onto "
+            f"visible content (e.g. past the dark gap).")
 
 
 def job_retake_generate(job, host: str, req: dict):
-    """Extract anchors + audio from the clip, generate the window, splice a preview."""
+    """Extract anchors + audio from the clip, generate the window, splice a preview.
+    Uses the EXACT SAME builder as normal Director parts (proven quality) —
+    mode 1 = the proven [image + txt] shape, mode 2 = the proven [tail video + txt]
+    shape, plus the node's native end-frame keyframe to land on the window end."""
     sess = retake_session()
     if not sess.get("clip"):
         raise DEPS["ToolError"]("Load a clip first")
@@ -715,9 +692,17 @@ def job_retake_generate(job, host: str, req: dict):
     S = int(round(start_sec * fps))
     E = int(round(end_sec * fps))
     win = E - S
-    lead = 121 if mode == 2 else 0
-    head = lead if mode == 2 else 1
-    total = head + win + 1
+    lead = 121 if mode == 2 else 0        # same 121-frame tail as the Director loop
+    if mode == 1 and S < 1:
+        raise DEPS["ToolError"]("Mode 1 needs at least 1 frame before the window "
+                                "(the start anchor is the frame just BEFORE it)")
+    img_frames = min(6, S) if mode == 1 else 0   # start-image zone, trimmed like the lead
+    head = lead if mode == 2 else img_frames
+    # the head/end zones are trimmed away afterwards — pad the END zone so the
+    # TOTAL lands exactly on the LTX frame grid (8n+1). Otherwise the node
+    # silently resizes to the nearest 8n+1 and every boundary drifts 2-3 frames.
+    end_frames = 6 + (1 - (head + win + 6)) % 8  # end keyframe zone (trimmed away)
+    total = head + win + end_frames              # always 8n+1
 
     work = NINJA_DIR / "retake" / "work"
     work.mkdir(parents=True, exist_ok=True)
@@ -727,38 +712,72 @@ def job_retake_generate(job, host: str, req: dict):
     end_png = work / f"{tag}_end.png"
     ffmpeg(job, ["-i", str(clip), "-vf", f"select='eq(n\\,{E})'", "-vsync", "0",
                  "-frames:v", "1", str(end_png)], "extracting end anchor")
+    _guard_black_anchor(end_png, "End ('To')", end_sec)
     start_png = lead_mp4 = None
     if mode == 1:
         start_png = work / f"{tag}_start.png"
-        ffmpeg(job, ["-i", str(clip), "-vf", f"select='eq(n\\,{max(0, S - 1)})'", "-vsync", "0",
+        # anchor = the frame just BEFORE the window: every frame of [S, E) gets
+        # regenerated; frame S-1 is the last original frame we continue from
+        ffmpeg(job, ["-i", str(clip), "-vf", f"select='eq(n\\,{S - 1})'", "-vsync", "0",
                      "-frames:v", "1", str(start_png)], "extracting start anchor")
+        _guard_black_anchor(start_png, "Start ('From')", (S - 1) / fps)
     else:
         lead_mp4 = work / f"{tag}_lead.mp4"
         ffmpeg(job, ["-i", str(clip),
                      "-vf", f"trim=start_frame={S - lead}:end_frame={S},setpts=PTS-STARTPTS",
                      "-an", "-c:v", "libx264", "-crf", "12", "-preset", "fast",
                      str(lead_mp4)], "extracting lead-in video")
-    audio_wav = work / f"{tag}_audio.wav"
-    ffmpeg(job, ["-i", str(clip), "-ss", f"{(S - head) / fps:.6f}", "-to", f"{(E + 1) / fps:.6f}",
-                 "-vn", "-ar", "44100", "-ac", "1", str(audio_wav)], "slicing clip audio")
+    # audio, the UI pattern: the lead video brings ITS OWN correlated audio;
+    # the new slice covers ONLY the regenerated window (+ end zone)
+    win_wav = work / f"{tag}_audio_win.wav"
+    win_wav_from = S if mode == 2 else S - img_frames   # mode 1: cover the image zone
+    ffmpeg(job, ["-i", str(clip), "-ss", f"{win_wav_from / fps:.6f}",
+                 "-to", f"{(E + end_frames) / fps:.6f}",
+                 "-vn", "-ar", "44100", "-ac", "1", str(win_wav)], "slicing window audio")
+    lead_wav = None
+    if lead:
+        lead_wav = work / f"{tag}_audio_lead.wav"
+        ffmpeg(job, ["-i", str(clip), "-ss", f"{(S - lead) / fps:.6f}", "-to", f"{S / fps:.6f}",
+                     "-vn", "-ar", "44100", "-ac", "1", str(lead_wav)], "slicing lead audio")
     job["progress"] = 0.15
 
-    # 2. upload + generate on the Director host
+    # 2. upload + generate on the Director host — THE SAME BUILDER AS PARTS
     end_up = comfy_upload(host, end_png, end_png.name)
     start_up = comfy_upload(host, start_png, start_png.name) if start_png else None
     lead_up = comfy_upload(host, lead_mp4, lead_mp4.name) if lead_mp4 else None
-    audio_up = comfy_upload(host, audio_wav, audio_wav.name)
-    graph = build_retake_graph(
-        prompts=req["prompts"], global_prompt=req.get("global_prompt", ""), fps=fps,
-        total=total, head=head, start_image=start_up, end_image=end_up,
-        lead_video=lead_up, audio_file=audio_up, part_name=tag)
+    win_wav_up = comfy_upload(host, win_wav, win_wav.name)
+    tracks = [(win_wav_up, 0, img_frames + win + end_frames)]
+    if lead_wav:
+        lead_wav_up = comfy_upload(host, lead_wav, lead_wav.name)
+        tracks = [(lead_wav_up, 0, lead), (win_wav_up, lead, win + end_frames)]
+    graph = build_director_graph(
+        host, prompts=req["prompts"],
+        from_sec=start_sec, to_sec=end_sec + end_frames / fps, fps=fps,
+        width=int(sess["clip"]["width"]), height=int(sess["clip"]["height"]),
+        tail_file=lead_up, tail_seconds=lead / fps if lead_up else 0.0,
+        image_file=start_up, global_prompt=req.get("global_prompt", ""),
+        part_name=f"retake_{tag}", song_file=win_wav_up, end_image_file=end_up,
+        audio_tracks=tracks, end_zone_frames=end_frames,
+        image_zone_frames=img_frames or None, total_frames=total)
     run = queue_and_wait(host, graph, job, f"retake {start_sec}-{end_sec}")
     job["progress"] = 0.75
     fn, sub = first_video_output(run)
     raw = work / f"{tag}_raw.mp4"
     comfy_download(host, fn, sub, raw)
 
-    # 3. patch = generated frames [head, head+win) — boundaries are original frames
+    # the whole alignment rests on the node honoring our 8n+1 total — verify,
+    # never splice shifted frames silently
+    vinfo = DEPS["ffprobe"](raw)
+    vstream = next((st for st in vinfo.get("streams", []) if st.get("codec_type") == "video"), {})
+    raw_frames = int(vstream.get("nb_frames") or 0) or \
+        int(round(float(vinfo.get("format", {}).get("duration") or 0) * fps))
+    if raw_frames != total:
+        raise DEPS["ToolError"](
+            f"Director returned {raw_frames} frames, expected {total} — the patch "
+            f"would be shifted. Aborting instead of splicing misaligned frames.")
+
+    # 3. patch = generated frames [head, head+win) — exactly `win` new frames,
+    # the head zone (lead video / start image) is trimmed away like in parts
     patch = work / f"{tag}_patch.mp4"
     ffmpeg(job, ["-i", str(raw),
                  "-vf", f"trim=start_frame={head}:end_frame={head + win},setpts=PTS-STARTPTS,"
