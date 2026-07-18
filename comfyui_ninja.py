@@ -509,8 +509,19 @@ def job_generate(job, host: str, p: dict, req: dict):
     raw = work / f"{part_name}_raw.mp4"
     comfy_download(host, fn, sub, raw)
 
+    # brightness calibration vs the previous part (same fix as the retake):
+    # the raw's opening frames REPRODUCE the pinned tail video — known content —
+    # so the VAE luma shift is measurable and baked into every cut of this part
+    luma_offset = 0.0
+    if tail:
+        o = _yavg(Path(tail["path"]), 0, 5)
+        g = _yavg(raw, 0, 5)
+        if o and g and len(o) == len(g):
+            luma_offset = max(-8.0, min(8.0, sum(a - b for a, b in zip(o, g)) / len(o)))
+
     chunk = {"id": uuid.uuid4().hex[:8], "part": part_name, "from": from_sec, "to": to_sec,
              "tail_used": bool(tail), "tail_seconds": tail_seconds,
+             "luma_offset": round(luma_offset, 2),
              "raw": str(raw), "final": None, "status": "review",
              "request": req, "host": host}
 
@@ -527,7 +538,10 @@ def job_generate(job, host: str, p: dict, req: dict):
             p["work_resolution"] = {"w": int(fst.get("width", 0)), "h": int(fst.get("height", 0))}
             save_project(p)
         wr = p["work_resolution"]
-        cvf = ["-vf", f"scale={wr['w']}:{wr['h']}:flags=lanczos", "-pix_fmt", "yuv420p"]
+        cscale = f"scale={wr['w']}:{wr['h']}:flags=lanczos"
+        if abs(luma_offset) >= 0.3:
+            cscale += f",lutyuv=y='clip(val{luma_offset:+.2f},0,255)'"
+        cvf = ["-vf", cscale, "-pix_fmt", "yuv420p"]
         cand = work / f"{part_name}_candidate.mp4"
         if chunk["tail_used"] and tail_seconds > 0:
             ffmpeg(job, ["-ss", f"{tail_seconds:.6f}", "-i", str(raw),
@@ -606,7 +620,13 @@ def job_continue(job, host: str, p: dict, accept_sec: float | None = None,
         p["work_resolution"] = {"w": int(fst.get("width", 0)), "h": int(fst.get("height", 0))}
         save_project(p)
     wr = p["work_resolution"]
-    vf = ["-vf", f"scale={wr['w']}:{wr['h']}:flags=lanczos"]
+    # apply the luma offset measured at generation time (vs the previous part's
+    # tail) to EVERY cut of this raw: the final part and the next tail
+    off = float(chunk.get("luma_offset") or 0.0)
+    vf_expr = f"scale={wr['w']}:{wr['h']}:flags=lanczos"
+    if abs(off) >= 0.3:
+        vf_expr += f",lutyuv=y='clip(val{off:+.2f},0,255)'"
+    vf = ["-vf", vf_expr]
     if chunk["tail_used"] and chunk["tail_seconds"] > 0:
         ffmpeg(job, ["-ss", f"{chunk['tail_seconds']:.6f}", "-i", str(raw),
                      "-t", f"{exact_len:.6f}", *vf, "-pix_fmt", "yuv420p",
@@ -628,8 +648,9 @@ def job_continue(job, host: str, p: dict, accept_sec: float | None = None,
     # the tail must end exactly where the ACCEPTED content ends
     tail_start = max(0.0, float(chunk["tail_seconds"]) + exact_len - tail_frames_cut / fps)
     tail_cut = work / f"{chunk['part']}_tailcut.mp4"
+    tail_vf = ["-vf", f"lutyuv=y='clip(val{off:+.2f},0,255)'"] if abs(off) >= 0.3 else []
     ffmpeg(job, ["-ss", f"{tail_start:.6f}", "-i", str(raw),
-                 "-frames:v", str(tail_frames_cut),
+                 "-frames:v", str(tail_frames_cut), *tail_vf,
                  "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-c:a", "aac",
                  str(tail_cut)], "cutting tail")
     job["progress"] = 0.3
@@ -647,10 +668,21 @@ def job_continue(job, host: str, p: dict, accept_sec: float | None = None,
         comfy_download(host, fn, sub, tail_up_big)
 
         # downscale back to the project resolution (part1's grid) — the upscaled
-        # tail must re-enter the Director at exactly the working size
+        # tail must re-enter the Director at exactly the working size.
+        # The upscaler is its own LTX pass with its own luma shift — measure it
+        # against tail_cut (known, already-corrected content) and correct here,
+        # so the tail pinned into the next part carries TRUE brightness
+        up_off = 0.0
+        o = _yavg(tail_cut, 0, 5)
+        g = _yavg(tail_up_big, 0, 5)
+        if o and g and len(o) == len(g):
+            up_off = max(-8.0, min(8.0, sum(a - b for a, b in zip(o, g)) / len(o)))
         wr = p["work_resolution"]
+        dvf = f"scale={wr['w']}:{wr['h']}:flags=lanczos"
+        if abs(up_off) >= 0.3:
+            dvf += f",lutyuv=y='clip(val{up_off:+.2f},0,255)'"
         tail_up = work / f"{chunk['part']}_tail_up.mp4"
-        ffmpeg(job, ["-i", str(tail_up_big), "-vf", f"scale={wr['w']}:{wr['h']}:flags=lanczos",
+        ffmpeg(job, ["-i", str(tail_up_big), "-vf", dvf,
                      "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-c:a", "aac",
                      str(tail_up)], "downscaling tail back to project resolution")
     else:
@@ -858,7 +890,12 @@ def job_retake_generate(job, host: str, req: dict):
 
 
 def job_standalone_upscale(job, host: str, req: dict):
-    """Upscaler tab: chained IC-upscale of a full video, chunked."""
+    """Upscaler tab: chained IC-upscale of a full video — the manual recipe:
+      part 1 = src frames [0, B1), anchored by the clip's own first frame
+      part N = src frames [B-1, Bnext) — starts WITH the previous part's last
+               source frame — anchored by the previous UPSCALED part's last frame
+      join   = every part minus its last frame + the final part as-is,
+               so each seam frame exists exactly once."""
     src = Path(DEPS["asset_path"](req["asset"]))
     chunk_len = float(req.get("chunk_seconds", 10))
     denoise = req.get("denoise")
@@ -866,42 +903,77 @@ def job_standalone_upscale(job, host: str, req: dict):
     work = NINJA_DIR / "upscaler" / uuid.uuid4().hex[:8]
     work.mkdir(parents=True, exist_ok=True)
 
-    ffmpeg(job, ["-i", str(src), "-c:v", "libx264", "-crf", "12", "-preset", "fast",
-                 "-c:a", "aac", "-force_key_frames", f"expr:gte(t,n_forced*{chunk_len})",
-                 "-f", "segment", "-segment_time", str(chunk_len), "-reset_timestamps", "1",
-                 str(work / "c%03d.mp4")], "splitting")
-    chunks = sorted(work.glob("c*.mp4"))
-    anchor_remote = None
+    info = DEPS["ffprobe"](src)
+    vs = next((st for st in info.get("streams", []) if st.get("codec_type") == "video"), {})
+    fr = (vs.get("r_frame_rate") or "24/1").split("/")
+    fps = float(fr[0]) / float(fr[1] if len(fr) > 1 and fr[1] else 1)
+    n_src = int(vs.get("nb_frames") or 0) or \
+        int(round(float(info["format"]["duration"]) * fps))
+    step = max(1, int(round(chunk_len * fps)))
+    cuts = list(range(step, n_src, step)) + [n_src]
+
+    # first anchor: explicit asset, or the clip's own first frame
     if req.get("anchor_asset"):
         a = Path(DEPS["asset_path"](req["anchor_asset"]))
         anchor_remote = comfy_upload(host, a, a.name)
-    results = []
-    for i, c in enumerate(chunks):
-        job["message"] = f"chunk {i+1}/{len(chunks)}"
-        job["progress"] = i / max(1, len(chunks))
+    else:
+        a0 = work / "anchor_000.png"
+        ffmpeg(job, ["-i", str(src), "-vf", "select='eq(n\\,0)'", "-vsync", "0",
+                     "-frames:v", "1", str(a0)], "extracting first-frame anchor")
+        anchor_remote = comfy_upload(host, a0, a0.name)
+
+    pieces = []
+    prev_b = 0
+    for i, b in enumerate(cuts):
+        s = 0 if i == 0 else prev_b - 1        # 1-frame overlap with the previous part
+        exp = b - s                            # expected frames in this part
+        job["message"] = f"part {i+1}/{len(cuts)}"
+        job["progress"] = i / max(1, len(cuts))
+        c = work / f"c{i:03d}.mp4"
+        ffmpeg(job, ["-i", str(src),
+                     "-vf", f"trim=start_frame={s}:end_frame={b},setpts=PTS-STARTPTS",
+                     "-an", "-c:v", "libx264", "-crf", "12", "-preset", "fast",
+                     str(c)], f"cutting part {i+1}")
         remote_v = comfy_upload(host, c, c.name)
         graph = build_upscale_graph(host, video_file=remote_v, anchor_file=anchor_remote,
                                     denoise=denoise, multiplier=mult,
                                     part_name=f"upsc_{src.stem}_{i:03d}")
-        run = queue_and_wait(host, graph, job, f"chunk {i+1}/{len(chunks)}")
+        run = queue_and_wait(host, graph, job, f"part {i+1}/{len(cuts)}")
         fn, sub = first_video_output(run)
         lp = work / f"up_{i:03d}.mp4"
         comfy_download(host, fn, sub, lp)
-        results.append(lp)
-        # next anchor = last frame of this upscaled chunk
+        uinfo = DEPS["ffprobe"](lp)
+        uvs = next((st for st in uinfo.get("streams", []) if st.get("codec_type") == "video"), {})
+        got = int(uvs.get("nb_frames") or 0) or \
+            int(round(float(uinfo["format"]["duration"]) * fps))
+        if got < exp:
+            raise DEPS["ToolError"](f"part {i+1}: upscaler returned {got} frames, "
+                                    f"expected {exp} — cannot join without a shift")
+        # next anchor = the upscaled version of THIS part's last source frame
         anchor_png = work / f"anchor_{i+1:03d}.png"
-        ffmpeg(job, ["-sseof", "-0.5", "-i", str(lp), "-update", "1", "-frames:v", "1",
-                     str(anchor_png)], "extracting anchor")
+        ffmpeg(job, ["-i", str(lp), "-vf", f"select='eq(n\\,{exp - 1})'", "-vsync", "0",
+                     "-frames:v", "1", str(anchor_png)], "extracting anchor")
         anchor_remote = comfy_upload(host, anchor_png, anchor_png.name)
+        # join piece: drop the last frame (the next part starts with it); the
+        # final part is kept whole; dangling frames past `exp` are dropped too
+        keep = exp if i == len(cuts) - 1 else exp - 1
+        piece = work / f"j_{i:03d}.mp4"
+        ffmpeg(job, ["-i", str(lp),
+                     "-vf", f"trim=start_frame=0:end_frame={keep},setpts=PTS-STARTPTS",
+                     "-an", "-c:v", "libx264", "-crf", "12", "-preset", "fast",
+                     str(piece)], f"trimming part {i+1} for join")
+        pieces.append(piece)
+        prev_b = b
 
     lst = work / "concat.txt"
-    lst.write_text("".join(f"file '{r}'\n" for r in results), encoding="utf-8")
+    lst.write_text("".join(f"file '{r}'\n" for r in pieces), encoding="utf-8")
     joined = work / "joined.mp4"
     ffmpeg(job, ["-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(joined)], "joining")
     out = DEPS["OUT_DIR"] / f"{src.stem}_upscaled_{int(time.time())}.mp4"
     ffmpeg(job, ["-i", str(joined), "-i", str(src), "-map", "0:v", "-map", "1:a?",
-                 "-c", "copy", "-shortest", str(out)], "muxing original audio")
-    return [DEPS["output_entry"](out, "video")]
+                 "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out)],
+           "muxing original audio")
+    return [DEPS["output_entry_abs"](out, "video", f"{src.stem} upscaled")]
 
 
 # ---------------------------------------------------------------- registration
