@@ -262,6 +262,28 @@ def ffmpeg(job, args: list, label: str):
     DEPS["run"]([DEPS["FFMPEG"], "-y", "-loglevel", "error"] + args)
 
 
+def _yavg(path: Path, start_frame: int, end_frame: int) -> list[float]:
+    """Mean luma (YAVG, 0-255) of decoded frames [start_frame, end_frame).
+
+    NOTE: trim ranges (no commas in expressions) and explicit mode=print —
+    the `metadata=print` positional shorthand mis-parses inside longer
+    filter chains on this ffmpeg build ("Option not found").
+    """
+    proc = DEPS["run"]([DEPS["FFMPEG"], "-y", "-loglevel", "error", "-i", str(path),
+                        "-vf", f"trim=start_frame={start_frame}:end_frame={end_frame},"
+                               f"signalstats,"
+                               f"metadata=mode=print:key=lavfi.signalstats.YAVG:file=-",
+                        "-f", "null", "-"])
+    vals = []
+    for line in (proc.stdout or "").splitlines():
+        if "YAVG=" in line:
+            try:
+                vals.append(float(line.rsplit("=", 1)[1].strip()))
+            except ValueError:
+                pass
+    return vals
+
+
 def media_duration(path: Path) -> float:
     info = DEPS["ffprobe"](path)
     return float(info.get("format", {}).get("duration") or 0.0)
@@ -294,8 +316,11 @@ def build_director_graph(host: str, *, prompts: list, from_sec: float, to_sec: f
 
     Timeline (all in frames, starting at 0):
       [tail video (tail_seconds)] or [image] or nothing
-      [text prompt segments...] filling the rest
-      [end-frame image] (optional, 6 frames, isEndFrame — native node feature)
+      [text prompt segments...] filling the regenerated window
+      [end-frame image] (optional, ONE frame immediately after the window,
+                         isEndFrame — native node feature)
+      [trailing text padding] (only with an end-frame image; fills the 8n+1
+                         grid, generated past the landing point, trimmed away)
       audio: one segment = song slice covering the whole window.
     """
     graph = copy.deepcopy(load_template("director"))
@@ -336,12 +361,26 @@ def build_director_graph(host: str, *, prompts: list, from_sec: float, to_sec: f
                          "length": ln, "prompt": p["text"], "isEndFrame": False})
         text_start += ln
     if end_image_file:
+        # the end keyframe sits IMMEDIATELY after the last regenerated frame —
+        # a 1-frame segment, so wherever the node pins it (segment start or
+        # end) it lands exactly at the window boundary. The rest of the end
+        # zone becomes trailing text padding AFTER the keyframe: it keeps the
+        # 8n+1 grid, is generated past the landing point and trimmed away.
+        # Before this, the keyframe sat at the far end of the padding, so the
+        # last kept frame was still mid-flight toward it (visible end jump).
         segments.append({
             "id": uuid.uuid4().hex[:13] + "_e", "type": "image",
-            "start": total_frames - end_frames, "length": end_frames,
+            "start": text_start, "length": 1,
             "imageFile": end_image_file, "fileName": end_image_file.split("/")[-1],
             "prompt": "", "isEndFrame": True,
         })
+        if end_frames > 1:
+            segments.append({
+                "id": uuid.uuid4().hex[:13] + "_p", "type": "text",
+                "start": text_start + 1, "length": end_frames - 1,
+                "prompt": prompts[-1]["text"] if prompts else "",
+                "isEndFrame": False,
+            })
 
     if audio_tracks:
         # explicit audio layout: list of (file, start_frame, num_frames) — the UI
@@ -701,7 +740,9 @@ def job_retake_generate(job, host: str, req: dict):
     # the head/end zones are trimmed away afterwards — pad the END zone so the
     # TOTAL lands exactly on the LTX frame grid (8n+1). Otherwise the node
     # silently resizes to the nearest 8n+1 and every boundary drifts 2-3 frames.
-    end_frames = 6 + (1 - (head + win + 6)) % 8  # end keyframe zone (trimmed away)
+    # (the end keyframe itself occupies only the FIRST frame of this zone —
+    # right after the last regenerated frame; the rest is trailing padding)
+    end_frames = 6 + (1 - (head + win + 6)) % 8  # end zone (trimmed away)
     total = head + win + end_frames              # always 8n+1
 
     work = NINJA_DIR / "retake" / "work"
@@ -777,11 +818,36 @@ def job_retake_generate(job, host: str, req: dict):
             f"would be shifted. Aborting instead of splicing misaligned frames.")
 
     # 3. patch = generated frames [head, head+win) — exactly `win` new frames,
-    # the head zone (lead video / start image) is trimmed away like in parts
+    # the head zone (lead video / start image) is trimmed away like in parts.
+    # Luma fix: the LTX VAE decode shifts brightness (~2-3 units darker) on
+    # everything it outputs. Measure the shift on frames whose content is
+    # KNOWN — the end keyframe IS original frame E (pinned at the last frame
+    # of the end zone); the start zone reproduces the start anchor / lead
+    # video — and correct the patch by that offset.
+    kf = head + win  # end keyframe position in the generation
+    samples = []
+    o = _yavg(clip, E, E + 1)
+    g = _yavg(raw, kf, kf + 1)
+    if o and g:
+        samples.append(o[0] - g[0])
+    if mode == 1 and img_frames:
+        o = _yavg(clip, S - 1, S)
+        g = _yavg(raw, img_frames // 2, img_frames // 2 + 1)
+        if o and g:
+            samples.append(o[0] - g[0])
+    elif mode == 2:
+        o = _yavg(clip, S - lead, S - lead + 5)
+        g = _yavg(raw, 0, 5)
+        if o and g and len(o) == len(g):
+            samples.append(sum(a - b for a, b in zip(o, g)) / len(o))
+    offset = max(-8.0, min(8.0, sum(samples) / len(samples))) if samples else 0.0
+    vf = (f"trim=start_frame={head}:end_frame={head + win},setpts=PTS-STARTPTS,"
+          f"scale={sess['clip']['width']}:{sess['clip']['height']}:flags=lanczos")
+    if abs(offset) >= 0.3:
+        vf += f",lutyuv=y='clip(val{offset:+.2f},0,255)'"
     patch = work / f"{tag}_patch.mp4"
     ffmpeg(job, ["-i", str(raw),
-                 "-vf", f"trim=start_frame={head}:end_frame={head + win},setpts=PTS-STARTPTS,"
-                        f"scale={sess['clip']['width']}:{sess['clip']['height']}:flags=lanczos",
+                 "-vf", vf,
                  "-pix_fmt", "yuv420p", "-an", "-r", str(fps),
                  "-c:v", "libx264", "-crf", "12", "-preset", "fast",
                  str(patch)], "trimming patch")
