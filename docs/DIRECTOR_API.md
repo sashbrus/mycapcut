@@ -202,3 +202,13 @@ Automated e2e: `scripts/e2e_director_api.py`
 ```powershell
 .\.venv\Scripts\python.exe scripts\e2e_director_api.py --seconds 8
 ```
+
+---
+
+## Phase 2 (Telegram + n8n)
+
+See `integrations/README.md`.
+
+- Telegram DM bot: `cupcut-telegram-bot` (menu → Director API)
+- HTTP tools for n8n: `http://127.0.0.1:8787/tools/*`
+- n8n webhook: `POST http://127.0.0.1:5678/webhook/cupcut-director` with `{"action":"status"}`

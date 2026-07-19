@@ -22,7 +22,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from fastapi import HTTPException, UploadFile, File, Form
+from fastapi import HTTPException, UploadFile, File, Form, Request
 
 # populated by register()
 DEPS: dict = {}
@@ -1149,11 +1149,21 @@ def register(app, deps: dict):
         return director_status(p)
 
     @app.post("/api/ninja/reset")
-    def ninja_reset():
+    async def ninja_reset(request: Request):
+        """Reset project chunks. Optional JSON body: {"clear_song": true} drops the track too."""
+        try:
+            req = await request.json()
+            if not isinstance(req, dict):
+                req = {}
+        except Exception:
+            req = {}
         p = project()
         p["chunks"], p["next_start"] = [], 0.0
         p.pop("pending_tail", None)
         p.pop("work_resolution", None)  # new project = new grid, from ITS part1
+        if bool(req.get("clear_song")):
+            p["song"] = None
+            p["name"] = ""
         save_project(p)
         return director_status(p)
 
@@ -1209,8 +1219,8 @@ def register(app, deps: dict):
         return director_status()
 
     @app.post("/api/director/reset")
-    def director_api_reset():
-        return ninja_reset()
+    async def director_api_reset(request: Request):
+        return await ninja_reset(request)
 
     @app.post("/api/director/generate")
     async def director_api_generate(req: dict):
