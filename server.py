@@ -27,6 +27,7 @@ import webbrowser
 from pathlib import Path
 
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -52,6 +53,14 @@ log = logging.getLogger("cupcut-studio")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 app = FastAPI(title="CupCut Studio")
+# External clients (n8n in Docker, scripts) call this API cross-origin.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".ts", ".wmv", ".flv"}
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
@@ -1246,6 +1255,7 @@ import comfyui_ninja
 comfyui_ninja.register(app, {
     "DATA": DATA, "OUT_DIR": OUT_DIR, "FFMPEG": FFMPEG,
     "run": run, "ffprobe": ffprobe, "start_job": start_job,
+    "get_job": lambda jid: _jobs.get(jid),
     "output_entry": output_entry, "ToolError": ToolError,
     "asset_path": lambda aid: Path(get_asset(aid)["path"]),
     "output_entry_abs": lambda path, kind, name=None: {
@@ -1296,6 +1306,8 @@ def _kill_stale_instance(port: int):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8765))
+    host = os.environ.get("HOST", "127.0.0.1")
     _kill_stale_instance(port)
-    threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    if host in ("127.0.0.1", "localhost"):
+        threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
+    uvicorn.run(app, host=host, port=port, log_level="warning")

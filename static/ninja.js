@@ -219,11 +219,12 @@
     const bar = $n("#nj-progress"), txt = $n("#nj-progress-text");
     $n("#nj-progress-wrap").hidden = false;
     try {
-      await pollJob(r.job, (j) => {
+      const done = await pollJob(r.job, (j) => {
         bar.style.width = Math.round((j.progress || 0) * 100) + "%";
         txt.textContent = `${label}: ${j.message || j.status}`;
       });
       toast(`${label} done`);
+      return done;
     } finally {
       $n("#nj-progress-wrap").hidden = true;
       refreshState();
@@ -400,7 +401,17 @@
       const a2 = await apiJSON("/api/upload", { method: "POST", body: fd2 });
       body.anchor_asset = a2.id;
     }
-    try { await runJob("/api/ninja/upscale", body, "Upscale"); }
+    try {
+      const done = await runJob("/api/ninja/upscale", body, "Upscale");
+      const box = $n("#nj-up-results");
+      box.innerHTML = "";
+      for (const o of (done && done.outputs) || []) {
+        if (o.kind !== "video") continue;
+        box.insertAdjacentHTML("beforeend",
+          `<div class="nj-row"><video src="${o.url}" controls style="width:100%;max-height:420px"></video></div>
+           <div class="nj-row"><a class="btn-small" href="${o.url}" download="${o.name}">⬇ ${o.name}</a></div>`);
+      }
+    }
     catch (e) { toast(e.message, true); }
   });
 })();

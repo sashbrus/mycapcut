@@ -492,10 +492,11 @@ def job_generate(job, host: str, p: dict, req: dict):
     else:
         width = int(req["width"]) if req.get("width") is not None else int(s["width"])
         height = int(req["height"]) if req.get("height") is not None else int(s["height"])
-        # the node snaps to /32 silently (720 -> 704) which desyncs the project
-        # grid — snap up-front so what you ask for is what everything else sees
-        width -= width % 32
-        height -= height % 32
+        # LTX latents need multiples of 64 (e.g. 480 → 512). Older note said /32
+        # (720 → 704); /64 is the real silent snap — do it up-front so the
+        # project grid matches Comfy output.
+        width = _snap_ltx_dim(width)
+        height = _snap_ltx_dim(height)
     graph = build_director_graph(
         host, prompts=req["prompts"], from_sec=from_sec, to_sec=to_sec, fps=fps,
         width=width, height=height, tail_file=tail_file,
@@ -960,6 +961,7 @@ def job_standalone_upscale(job, host: str, req: dict):
         piece = work / f"j_{i:03d}.mp4"
         ffmpeg(job, ["-i", str(lp),
                      "-vf", f"trim=start_frame=0:end_frame={keep},setpts=PTS-STARTPTS",
+                     "-pix_fmt", "yuv420p",  # LTX outputs 10-bit — browsers can't play it
                      "-an", "-c:v", "libx264", "-crf", "12", "-preset", "fast",
                      str(piece)], f"trimming part {i+1} for join")
         pieces.append(piece)
@@ -976,6 +978,91 @@ def job_standalone_upscale(job, host: str, req: dict):
     return [DEPS["output_entry_abs"](out, "video", f"{src.stem} upscaled")]
 
 
+def _snap_ltx_dim(v: int, step: int = 64) -> int:
+    """Round to nearest LTX-safe size (multiples of 64). 0 means 'unset'."""
+    if v <= 0:
+        return v
+    return max(step, int(round(v / step) * step))
+
+
+# ---------------------------------------------------------------- public API helpers
+
+def file_url(path) -> str | None:
+    """HTTP URL for a file under the ninja data dir (same as UI /api/ninja/file)."""
+    if not path:
+        return None
+    return "/api/ninja/file?path=" + urllib.parse.quote(str(path))
+
+
+def public_project(p: dict | None = None) -> dict:
+    """Project snapshot with stable HTTP media URLs for external clients."""
+    out = copy.deepcopy(p if p is not None else project())
+    song = out.get("song")
+    if song and song.get("path"):
+        song["url"] = file_url(song["path"])
+    for c in out.get("chunks") or []:
+        for key in ("raw", "preview", "final"):
+            if c.get(key):
+                c[f"{key}_url"] = file_url(c[key])
+    tail = out.get("pending_tail")
+    if tail and tail.get("path"):
+        tail["url"] = file_url(tail["path"])
+    return out
+
+
+def director_phase(p: dict | None = None) -> str:
+    p = p if p is not None else project()
+    if not p.get("song"):
+        return "needs_song"
+    chunks = p.get("chunks") or []
+    last = chunks[-1] if chunks else None
+    if last and not last.get("final"):
+        return "review"
+    if p.get("pending_tail"):
+        return "ready_extend"
+    return "ready_new"
+
+
+def director_status(p: dict | None = None) -> dict:
+    """Automation-friendly director status (phase, actions, URLs)."""
+    p = p if p is not None else project()
+    phase = director_phase(p)
+    templates = template_status()
+    pub = public_project(p)
+    last = (pub.get("chunks") or [None])[-1]
+    return {
+        "ok": True,
+        "phase": phase,
+        "ready": bool(p.get("song")) and bool(templates.get("director")),
+        "templates": templates,
+        "project": pub,
+        "chunk": last,
+        "next_start": pub.get("next_start", 0.0),
+        "work_resolution": pub.get("work_resolution"),
+        "pending_tail": pub.get("pending_tail"),
+        "actions": {
+            "can_generate": phase in ("ready_new", "ready_extend"),
+            "can_continue": phase == "review",
+            "can_retake": phase == "review",
+            "can_reset": bool(p.get("song")),
+        },
+        "config": cfg(),
+    }
+
+
+def start_ninja_job(label: str, fn, *args) -> dict:
+    """Background job that attaches director_status() on success for API clients."""
+    def runner(job, *a):
+        outs = fn(job, *a)
+        job["result"] = director_status()
+        return outs
+    return DEPS["start_job"](label, runner, *args)
+
+
+def _job_response(job: dict) -> dict:
+    return {"ok": True, "job": job["id"], "status_url": f"/api/job/{job['id']}"}
+
+
 # ---------------------------------------------------------------- registration
 
 def register(app, deps: dict):
@@ -989,8 +1076,11 @@ def register(app, deps: dict):
     @app.get("/api/ninja/state")
     def ninja_state():
         p = project()
-        return {"config": cfg(), "templates": template_status(), "project": p,
-                "retake": retake_session()}
+        status = director_status(p)
+        return {"config": status["config"], "templates": status["templates"],
+                "project": status["project"], "retake": retake_session(),
+                "phase": status["phase"], "actions": status["actions"],
+                "ready": status["ready"]}
 
     @app.post("/api/ninja/config")
     async def ninja_config(req: dict):
@@ -1027,7 +1117,7 @@ def register(app, deps: dict):
         p.pop("pending_tail", None)
         p.pop("work_resolution", None)  # new project = new grid, from ITS part1
         save_project(p)
-        return p
+        return director_status(p)
 
     @app.post("/api/ninja/import_part")
     async def ninja_import_part(file: UploadFile = File(...), from_sec: float = Form(0.0)):
@@ -1056,7 +1146,7 @@ def register(app, deps: dict):
                  "host": "director"}
         p["chunks"] = [c for c in p["chunks"] if c.get("final")] + [chunk]
         save_project(p)
-        return p
+        return director_status(p)
 
     @app.post("/api/ninja/reset")
     def ninja_reset():
@@ -1065,7 +1155,7 @@ def register(app, deps: dict):
         p.pop("pending_tail", None)
         p.pop("work_resolution", None)  # new project = new grid, from ITS part1
         save_project(p)
-        return p
+        return director_status(p)
 
     @app.post("/api/ninja/generate")
     async def ninja_generate(req: dict):
@@ -1075,8 +1165,8 @@ def register(app, deps: dict):
         if not req.get("prompts"):
             raise HTTPException(400, "At least one text prompt segment required")
         load_template("director")  # fail fast if missing
-        job = DEPS["start_job"]("ninja-generate", job_generate, "director", p, req)
-        return {"job": job["id"]}
+        job = start_ninja_job("ninja-generate", job_generate, "director", p, req)
+        return _job_response(job)
 
     @app.post("/api/ninja/retake")
     async def ninja_retake(req: dict = None):
@@ -1090,8 +1180,8 @@ def register(app, deps: dict):
         dur = (req or {}).get("duration_sec")
         if dur:
             new_req["to_sec"] = round(float(new_req["from_sec"]) + float(dur), 3)
-        job = DEPS["start_job"]("ninja-retake", job_generate, "director", p, new_req)
-        return {"job": job["id"]}
+        job = start_ninja_job("ninja-retake", job_generate, "director", p, new_req)
+        return _job_response(job)
 
     @app.post("/api/ninja/continue")
     async def ninja_continue(req: dict = None):
@@ -1102,15 +1192,45 @@ def register(app, deps: dict):
         if upscale_tail:
             load_template("upscaler")  # fail fast with a clear message if missing
         accept = (req or {}).get("accept_sec")
-        job = DEPS["start_job"]("ninja-continue", job_continue, "upscaler", p,
-                                accept, upscale_tail)
-        return {"job": job["id"]}
+        job = start_ninja_job("ninja-continue", job_continue, "upscaler", p,
+                              accept, upscale_tail)
+        return _job_response(job)
 
     @app.post("/api/ninja/upscale")
     async def ninja_upscale(req: dict):
         load_template("upscaler")
-        job = DEPS["start_job"]("ninja-upscale", job_standalone_upscale, "upscaler", req)
-        return {"job": job["id"]}
+        job = start_ninja_job("ninja-upscale", job_standalone_upscale, "upscaler", req)
+        return _job_response(job)
+
+    # ---- External Director API (same pipeline; stable contract for automation) ----
+
+    @app.get("/api/director/status")
+    def director_api_status():
+        return director_status()
+
+    @app.post("/api/director/reset")
+    def director_api_reset():
+        return ninja_reset()
+
+    @app.post("/api/director/generate")
+    async def director_api_generate(req: dict):
+        return await ninja_generate(req)
+
+    @app.post("/api/director/continue")
+    async def director_api_continue(req: dict = None):
+        return await ninja_continue(req)
+
+    @app.post("/api/director/retake")
+    async def director_api_retake(req: dict = None):
+        return await ninja_retake(req)
+
+    @app.get("/api/director/job/{jid}")
+    def director_api_job(jid: str):
+        job = DEPS.get("get_job", lambda _jid: None)(jid)
+        if job is None:
+            # fall back: jobs live in server._jobs; injected below when available
+            raise HTTPException(404, "job not found")
+        return job
 
     # ---------------- Retake (clip window patching) ----------------
 
