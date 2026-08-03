@@ -70,7 +70,8 @@ Media fields include HTTP paths such as `preview_url`, `final_url`, `pending_tai
 | `source` | `"new"` = fresh cut; `"extend"` = use `pending_tail` |
 | `prompts` | At least one `{ "text": "..." }` |
 | `global_prompt` | Optional style / subject |
-| `image_asset` | Optional asset id (start image, `source: "new"` only) |
+| `image_asset` | Optional start image asset id (`source: "new"` only) |
+| `end_image_asset` | Optional end image (FLF / land on still) — works with new or extend |
 
 Response:
 
@@ -95,10 +96,15 @@ Response:
 ### Retake — `POST /api/director/retake`
 
 ```json
-{ "duration_sec": 8 }
+{
+  "duration_sec": 8,
+  "global_prompt": "optional override",
+  "prompts": [{"text": "optional new scene prompt"}]
+}
 ```
 
-`duration_sec` optional — change length; seed is always new.
+`duration_sec` optional — change length; seed is always new.  
+Omit `global_prompt` / `prompts` to keep the previous chunk’s texts.
 
 ### Reset — `POST /api/director/reset`
 

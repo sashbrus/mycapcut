@@ -1262,11 +1262,18 @@ const TOOL_DEFS = [
   },
   {
     id: "grab_frame", icon: "📸", title: "Grab a frame",
-    desc: "Save a single frame of a video as a PNG image.",
+    desc: "PNG of one video frame. Pick Last/First/Middle, OR At time, OR At frame number — not both.",
     files: [{ name: "file", label: "Video", accept: "video/*" }],
     fields: [
-      { name: "which", type: "radio", label: "Which frame", options: [["last", "Last"], ["first", "First"], ["middle", "Middle"], ["at", "At time…"]], value: "last" },
-      { name: "timestamp", type: "text", label: "Timestamp (for 'At time')", placeholder: "e.g. 0:30" },
+      { name: "which", type: "radio", label: "Which frame", options: [
+        ["last", "Last"],
+        ["first", "First"],
+        ["middle", "Middle"],
+        ["at", "At time"],
+        ["frame", "At frame number"],
+      ], value: "frame" },
+      { name: "timestamp", type: "text", label: "Time (only if “At time”)", placeholder: "e.g. 0:30", showWhen: { which: "at" } },
+      { name: "frame_number", type: "number", label: "Frame # (only if “At frame number”)", placeholder: "e.g. 482", value: "", step: 1, min: 0, showWhen: { which: "frame" } },
     ],
   },
   {
@@ -1361,9 +1368,11 @@ function openTool(def) {
     form.appendChild(wrap);
   }
 
+  const conditionalFields = [];
   for (const f of def.fields) {
     const wrap = document.createElement("div");
     wrap.className = "field";
+    if (f.showWhen) wrap.dataset.showWhen = JSON.stringify(f.showWhen);
     if (f.type === "radio") {
       wrap.innerHTML = `<label class="f-label">${f.label}</label><div class="radio-row">` +
         f.options.map(([v, l]) =>
@@ -1377,13 +1386,29 @@ function openTool(def) {
       wrap.innerHTML = `<label class="check-row"><input type="checkbox" name="f_${f.name}" ${f.value ? "checked" : ""}> ${f.label}</label>`;
     } else if (f.type === "number") {
       wrap.innerHTML = `<label class="f-label">${f.label}</label>
-        <input type="number" name="f_${f.name}" value="${f.value}" step="${f.step || 1}">`;
+        <input type="number" name="f_${f.name}" value="${f.value ?? ""}" step="${f.step || 1}" placeholder="${f.placeholder || ""}">`;
     } else {
       wrap.innerHTML = `<label class="f-label">${f.label}</label>
         <input type="text" name="f_${f.name}" placeholder="${f.placeholder || ""}">`;
     }
     form.appendChild(wrap);
+    if (f.showWhen) conditionalFields.push({ f, wrap });
   }
+
+  function syncConditionalFields() {
+    for (const { f, wrap } of conditionalFields) {
+      let show = true;
+      for (const [key, want] of Object.entries(f.showWhen || {})) {
+        const el = form.querySelector(`[name="f_${key}"]:checked`) || form.querySelector(`[name="f_${key}"]`);
+        const got = el ? el.value : "";
+        if (got !== want) show = false;
+      }
+      wrap.hidden = !show;
+      wrap.style.display = show ? "" : "none";
+    }
+  }
+  form.addEventListener("change", syncConditionalFields);
+  syncConditionalFields();
 
   const go = document.createElement("button");
   go.className = "tool-go";
@@ -1403,13 +1428,47 @@ function openTool(def) {
         return;
       }
     }
+    const whichEl = form.querySelector(`[name="f_which"]:checked`);
+    const which = whichEl ? whichEl.value : "last";
     const fd = new FormData();
     for (const [name, files] of Object.entries(picked))
       for (const file of files) fd.append(name, file);
-    for (const f of def.fields) {
-      const el = form.querySelector(`[name="f_${f.name}"]${f.type === "radio" ? ":checked" : ""}`);
-      if (!el) continue;
-      fd.append(f.name, f.type === "check" ? String(el.checked) : el.value);
+
+    // Grab frame: send ONLY the relevant fields (never confuse time vs frame)
+    if (def.id === "grab_frame") {
+      fd.append("which", which);
+      if (which === "frame") {
+        const fn = form.querySelector(`[name="f_frame_number"]`);
+        const n = fn ? String(fn.value || "").trim() : "";
+        if (!n) {
+          toast("Enter frame number (e.g. 482) — no timestamp needed", true);
+          return;
+        }
+        fd.append("frame_number", n);
+        fd.append("frame", n);
+      } else if (which === "at") {
+        const ts = form.querySelector(`[name="f_timestamp"]`);
+        const t = ts ? String(ts.value || "").trim() : "";
+        if (!t) {
+          toast("Enter timestamp (e.g. 0:30)", true);
+          return;
+        }
+        fd.append("timestamp", t);
+      }
+    } else {
+      for (const f of def.fields) {
+        if (f.showWhen) {
+          let visible = true;
+          for (const [key, want] of Object.entries(f.showWhen)) {
+            const el = form.querySelector(`[name="f_${key}"]:checked`) || form.querySelector(`[name="f_${key}"]`);
+            if (!el || el.value !== want) visible = false;
+          }
+          if (!visible) continue;
+        }
+        const el = form.querySelector(`[name="f_${f.name}"]${f.type === "radio" ? ":checked" : ""}`);
+        if (!el) continue;
+        fd.append(f.name, f.type === "check" ? String(el.checked) : el.value);
+      }
     }
     go.disabled = true;
     prog.hidden = false;

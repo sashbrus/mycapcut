@@ -9,7 +9,7 @@ Backend: FastAPI + ffmpeg.
     tracks) into a single MP4 via one ffmpeg filter_complex graph.
   - Long operations run as background jobs with real ffmpeg progress.
 
-Run:  python server.py   (serves http://127.0.0.1:8765)
+Run:  python server.py   (HOST=127.0.0.1 by default; set HOST=0.0.0.0 for LAN)
 """
 
 from __future__ import annotations
@@ -133,6 +133,12 @@ def media_meta(path: Path) -> dict:
             meta["fps"] = round(float(n) / float(d), 3) if float(d) else 0
         except (ValueError, ZeroDivisionError):
             meta["fps"] = 0
+        try:
+            meta["frames"] = int(v.get("nb_frames") or 0)
+        except (TypeError, ValueError):
+            meta["frames"] = 0
+        if not meta["frames"] and meta.get("fps") and dur:
+            meta["frames"] = int(round(dur * float(meta["fps"])))
     return meta
 
 
@@ -677,6 +683,15 @@ def api_job(jid: str):
     return job
 
 
+@app.get("/api/jobs")
+def api_jobs(status: str | None = None):
+    """List recent jobs (newest first). Optional ?status=running"""
+    items = sorted(_jobs.values(), key=lambda j: float(j.get("created") or 0), reverse=True)
+    if status:
+        items = [j for j in items if j.get("status") == status]
+    return {"ok": True, "jobs": items[:40], "count": len(items)}
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -884,15 +899,56 @@ def tool_extract_audio(job, fields, files):
 
 def tool_grab_frame(job, fields, files):
     src = files["file"][0]
-    dur = _dur(src)
-    which = fields.get("which", "last")
+    meta = media_meta(src)
+    dur = float(meta.get("duration") or _dur(src) or 0.0)
+    fps = float(meta.get("fps") or 0.0) or 24.0
+    which = str(fields.get("which") or "last").strip().lower()
+    out = out_path(".png", "frame")
+    raw_frame = fields.get("frame_number")
+    if raw_frame is None or str(raw_frame).strip() == "":
+        raw_frame = fields.get("frame")
+    has_frame = raw_frame is not None and str(raw_frame).strip() != ""
+
+    # FRAME NUMBER PATH — never touches timestamp
+    if has_frame or which in ("frame", "at_frame", "by_frame", "framenumber", "frame_number"):
+        if not has_frame:
+            raise ToolError("Frame number required (e.g. 482). No timestamp needed.")
+        try:
+            n = int(float(str(raw_frame).strip()))
+        except (TypeError, ValueError):
+            raise ToolError("Frame number must be an integer (e.g. 482).")
+        if n < 0:
+            raise ToolError("Frame number must be ≥ 0.")
+        total = int(meta.get("frames") or 0)
+        if not total and dur > 0 and fps > 0:
+            total = int(round(dur * fps))
+        if total and n >= total:
+            raise ToolError(f"Frame {n} out of range (~{total} frames, 0–{total - 1}).")
+        run([FFMPEG, "-y", "-i", str(src),
+             "-vf", f"select=eq(n\\,{n})", "-vsync", "0",
+             "-frames:v", "1", "-q:v", "2", str(out)])
+        if not out.exists() or out.stat().st_size <= 0:
+            extract_frame_png(str(src), n / fps, out)
+        job["message"] = f"grabbed frame {n}"
+        return [output_entry(out, "image")]
+
+    # TIME PATH — only when At time
+    if which == "at":
+        ts = fields.get("timestamp")
+        if ts is None or str(ts).strip() == "":
+            raise ToolError("Timestamp required for “At time” (e.g. 0:30). Or switch to “At frame number”.")
+        t = parse_ts(ts)
+        if t < 0 or t > dur + 0.05:
+            raise ToolError(f"Timestamp must be within 0 — {fmt_ts(dur)}.")
+        extract_frame_png(str(src), t, out)
+        return [output_entry(out, "image")]
+
     t = {"first": 0.0, "last": max(0.0, dur - 0.05), "middle": dur / 2}.get(which)
     if t is None:
-        t = parse_ts(fields.get("timestamp"))
-        if t < 0 or t > dur:
-            raise ToolError(f"Timestamp must be within 0 — {fmt_ts(dur)}.")
-    out = out_path(".png", "frame")
-    run([FFMPEG, "-y", "-ss", f"{t:.3f}", "-i", src, "-frames:v", "1", "-q:v", "2", out])
+        raise ToolError(
+            f"Unknown which={which!r}. Use last/first/middle, or At frame number + frame #, or At time + timestamp."
+        )
+    extract_frame_png(str(src), t, out)
     return [output_entry(out, "image")]
 
 
@@ -1256,6 +1312,7 @@ comfyui_ninja.register(app, {
     "DATA": DATA, "OUT_DIR": OUT_DIR, "FFMPEG": FFMPEG,
     "run": run, "ffprobe": ffprobe, "start_job": start_job,
     "get_job": lambda jid: _jobs.get(jid),
+    "list_jobs": lambda: list(_jobs.values()),
     "output_entry": output_entry, "ToolError": ToolError,
     "asset_path": lambda aid: Path(get_asset(aid)["path"]),
     "output_entry_abs": lambda path, kind, name=None: {

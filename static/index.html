@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CupCut Studio</title>
+<script src="/boot.js"></script>
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
 </head>
@@ -174,9 +175,29 @@
           <input type="file" id="nj-img-file" accept="image/*">
         </div>
         <div class="nj-row">
+          <label title="FLF end still — works with new or extend (tail+txt+end img)">End image (FLF):</label>
+          <input type="file" id="nj-end-img-file" accept="image/*">
+        </div>
+        <div class="nj-row">
+          <label title="Ingredients IC-LoRA refs for character consistency">IC images:</label>
+          <input type="file" id="nj-ic-imgs" accept="image/*" multiple>
+          <label>IC video:</label>
+          <input type="file" id="nj-ic-vid" accept="video/*">
+        </div>
+        <div class="nj-row">
           <label>From (s)</label><input type="number" id="nj-from" step="0.1" style="width:80px">
           <label>Length (s) — you decide, end on a finished word!</label>
           <input type="number" id="nj-len" value="20" step="0.5" style="width:80px">
+          <label>Size</label>
+          <select id="nj-size-preset">
+            <option value="">custom / locked</option>
+            <option value="704x1280">704×1280</option>
+            <option value="1280x704">1280×704</option>
+            <option value="1020x1980">1020×1980 → 1024×1984</option>
+            <option value="1980x1020">1980×1020 → 1984×1024</option>
+            <option value="512x640">512×640</option>
+            <option value="768x512">768×512</option>
+          </select>
           <label title="0/0 = use the pinned video's own size (recommended)">W</label>
           <input type="number" id="nj-gen-w" step="32" style="width:80px">
           <label>H</label>
@@ -207,6 +228,10 @@
             <input type="checkbox" id="nj-tail-upscale"> ⬆ upscale tail</label>
           <button id="nj-continue" class="btn-accent">✔ Continue → finalize + prep tail</button>
         </div>
+        <div class="nj-row" style="margin-top:8px">
+          <button id="nj-finish" class="btn-accent">🏁 Finish song → full MP4</button>
+          <span id="nj-song-progress" class="nj-muted"></span>
+        </div>
       </div>
     </div>
 
@@ -222,17 +247,29 @@
   <section id="nj-upscaler" class="nj-body" hidden>
     <div class="tool-card">
       <h3>Chained IC-Upscale</h3>
-      <p class="nj-muted">Splits into chunks, upscales each, chains every chunk's last frame
-        as the next chunk's anchor, reassembles with original audio.</p>
-      <div class="nj-row"><label>Video</label><input type="file" id="nj-up-file" accept="video/*"></div>
-      <div class="nj-row"><label>First-chunk anchor image (optional)</label>
-        <input type="file" id="nj-up-anchor" accept="image/*"></div>
+      <p class="nj-muted">Part1: first-frame image anchor. Later parts: cut with 1-frame
+        overlap + VHS <b>skip_first_frames=1</b> (shift1). Join keeps <b>all</b> output
+        frames + original audio. Optional Grok refine via grokmcp
+        <code>edit_image</code> (<code>vigilant_gould</code>).
+        Queue several videos and walk away — they run one after another on the server.</p>
       <div class="nj-row">
-        <label>Chunk (s)</label><input type="number" id="nj-up-chunk" value="10" style="width:70px">
+        <label>Chunk (s)</label><input type="number" id="nj-up-chunk" value="10" style="width:70px" title="Rounded to LTX 8n+1 frames (e.g. 10s@24fps → 241f)">
         <label>Denoise</label><input type="number" id="nj-up-den" value="1.0" step="0.05" style="width:70px">
         <label>Multiplier</label><input type="number" id="nj-up-mult" value="1.3" step="0.05" style="width:70px">
       </div>
-      <button id="nj-up-run" class="btn-accent">▶ Upscale</button>
+      <div class="nj-row">
+        <label title="grokmcp edit_image via docker vigilant_gould">
+          <input type="checkbox" id="nj-up-grok" checked> Grok refine anchors (MCP)</label>
+      </div>
+      <div class="nj-row">
+        <label class="btn-small nj-file-btn">＋ Add videos to queue
+          <input type="file" id="nj-up-file" accept="video/*" multiple hidden></label>
+        <button id="nj-up-clear" class="btn-small" type="button">Clear queue</button>
+      </div>
+      <div id="nj-up-queue" class="nj-muted">Queue empty.</div>
+      <div class="nj-row" style="margin-top:8px">
+        <button id="nj-up-run" class="btn-accent">▶ Start queue</button>
+      </div>
       <div id="nj-up-results"></div>
     </div>
   </section>
@@ -295,6 +332,11 @@
         <label>Tail ×</label><input type="number" id="nj-set-mult" step="0.05" style="width:70px">
         <label>W</label><input type="number" id="nj-set-w" step="32" style="width:80px">
         <label>H</label><input type="number" id="nj-set-h" step="32" style="width:80px">
+      </div>
+      <div class="nj-row">
+        <label title="Optional override. Preferred: Capture Director after selecting Ingredients IC-LoRA in Comfy">IC-LoRA override</label>
+        <input id="nj-set-ic-lora" style="flex:1"
+               placeholder="leave empty — use Captured template">
       </div>
       <button id="nj-save-config" class="btn-accent">💾 Save</button>
       <h3>Workflow templates <span class="nj-muted">(run the workflow once manually on its host → Capture)</span></h3>

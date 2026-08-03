@@ -5,6 +5,8 @@
 (function () {
   const $n = (sel) => document.querySelector(sel);
   let ninjaState = null;
+  let promptCount = 0;
+  let promptsHydrated = false;
 
   /* ---------- tab wiring ---------- */
   const tabBtn = $n("#tab-ninja");
@@ -55,6 +57,8 @@
     $n("#nj-set-mult").value = s.tail_upscale_multiplier;
     $n("#nj-set-w").value = s.width;
     $n("#nj-set-h").value = s.height;
+    const icEl = $n("#nj-set-ic-lora");
+    if (icEl) icEl.value = s.ic_lora_name || "";
     for (const kind of ["director", "upscaler"]) {
       const el = $n(`#nj-tpl-${kind}`);
       el.textContent = t[kind] ? "✔ captured" : "✖ missing";
@@ -74,6 +78,8 @@
             tail_upscale_multiplier: +$n("#nj-set-mult").value,
             width: +$n("#nj-set-w").value, height: +$n("#nj-set-h").value,
             frame_rate: 24,
+            ic_lora_name: ($n("#nj-set-ic-lora")?.value || "").trim(),
+            ic_lora_strength: 1.0,
           },
         }) });
       toast("Saved");
@@ -100,15 +106,78 @@
   }));
 
   /* ---------- director tab ---------- */
-  let promptCount = 0;
+
+  function latestExecutedPrompts() {
+    const p = ninjaState.project || {};
+    if (p.last_prompts && (p.last_prompts.global_prompt || (p.last_prompts.prompts || []).length))
+      return p.last_prompts;
+    const chunks = p.chunks || [];
+    for (let i = chunks.length - 1; i >= 0; i--) {
+      const req = chunks[i].request || {};
+      if (req.imported) continue;
+      if ((req.global_prompt || "").trim() || (req.prompts || []).length)
+        return { global_prompt: req.global_prompt || "", prompts: req.prompts || [] };
+    }
+    return null;
+  }
+
+  function hydrateComposerPrompts(force) {
+    const lp = latestExecutedPrompts();
+    const g = $n("#nj-global");
+    const boxes = [...document.querySelectorAll("#nj-prompts textarea")];
+    const hasTyped = (g.value || "").trim() || boxes.some(t => (t.value || "").trim());
+    // After reset/song wipe (no chunks) always restore last executed
+    const noChunks = !((ninjaState.project || {}).chunks || []).length;
+    if (!lp) {
+      if (promptCount === 0) addPrompt();
+      return;
+    }
+    if (!force && promptsHydrated && hasTyped && !noChunks) return;
+
+    g.value = lp.global_prompt || "";
+    $n("#nj-prompts").innerHTML = "";
+    promptCount = 0;
+    const segs = lp.prompts || [];
+    if (!segs.length) addPrompt();
+    else {
+      for (const seg of segs) {
+        addPrompt();
+        const ta = $n("#nj-prompts").lastElementChild.querySelector("textarea");
+        ta.value = typeof seg === "string" ? seg : (seg.text || "");
+      }
+    }
+    promptsHydrated = true;
+  }
 
   function renderDirector() {
     const p = ninjaState.project;
     const songEl = $n("#nj-song-info");
+    const prog = ninjaState.progress || {};
     if (p.song) {
-      songEl.textContent = `♪ ${p.song.filename} — ${fmtSec(p.song.duration)} | next chunk starts at ${fmtSec(p.next_start)}`;
+      const marks = (prog.milestones || [])
+        .map(m => `${m.done ? "✓" : "·"}${m.at}s`)
+        .join(" ");
+      songEl.textContent =
+        `♪ ${p.song.filename} — ${fmtSec(p.song.duration)} | next ${fmtSec(p.next_start)}` +
+        (prog.song_sec
+          ? ` | covered ${fmtSec(prog.covered_sec)} (${prog.percent || 0}%)`
+          : "");
+      const pe = $n("#nj-song-progress");
+      if (pe) {
+        pe.textContent = marks
+          ? `Progress: ${marks}${prog.past_end ? " — past song end → Finish" : ""}`
+          : "";
+      }
     } else {
       songEl.textContent = "No song loaded — upload the track first.";
+    }
+    const finBtn = $n("#nj-finish");
+    if (finBtn) {
+      const can = !!(ninjaState.actions || {}).can_finish;
+      finBtn.disabled = !can;
+      finBtn.title = can
+        ? "Stitch all approved parts + song audio into one MP4"
+        : "Need at least one approved part (Continue)";
     }
     $n("#nj-from").value = (p.next_start || 0).toFixed(1);
     // dimension fields: initialize from Settings once, then respect user edits
@@ -160,7 +229,7 @@
             ? `${last.part} — cumulative + original audio. Retake or Continue?`
             : `${last.part} — Retake or Continue?`);
     }
-    if (promptCount === 0) addPrompt();
+    hydrateComposerPrompts(false);
   }
 
   function fmtSec(s) { const m = Math.floor(s / 60); return `${m}:${String(Math.floor(s % 60)).padStart(2, "0")}`; }
@@ -231,6 +300,14 @@
     }
   }
 
+  $n("#nj-size-preset")?.addEventListener("change", () => {
+    const v = $n("#nj-size-preset").value;
+    if (!v) return;
+    const [w, h] = v.split("x").map(Number);
+    $n("#nj-gen-w").value = w;
+    $n("#nj-gen-h").value = h;
+  });
+
   $n("#nj-generate").addEventListener("click", async () => {
     const prompts = [...document.querySelectorAll("#nj-prompts textarea")]
       .map(t => ({ text: t.value.trim() })).filter(p => p.text);
@@ -250,6 +327,30 @@
       const asset = await apiJSON("/api/upload", { method: "POST", body: fd });
       body.image_asset = asset.id;
     }
+    const endInp = $n("#nj-end-img-file");
+    if (endInp?.files?.[0]) {
+      const fd = new FormData();
+      fd.append("file", endInp.files[0]);
+      const asset = await apiJSON("/api/upload", { method: "POST", body: fd });
+      body.end_image_asset = asset.id;
+    }
+    const icImgs = $n("#nj-ic-imgs");
+    if (icImgs?.files?.length) {
+      body.ic_image_assets = [];
+      for (const f of icImgs.files) {
+        const fd = new FormData();
+        fd.append("file", f);
+        const asset = await apiJSON("/api/upload", { method: "POST", body: fd });
+        body.ic_image_assets.push(asset.id);
+      }
+    }
+    const icVid = $n("#nj-ic-vid");
+    if (icVid?.files?.[0]) {
+      const fd = new FormData();
+      fd.append("file", icVid.files[0]);
+      const asset = await apiJSON("/api/upload", { method: "POST", body: fd });
+      body.ic_video_assets = [asset.id];
+    }
     try { await runJob("/api/ninja/generate", body, "Generate"); }
     catch (e) { toast(e.message, true); }
   });
@@ -258,6 +359,14 @@
     const len = +$n("#nj-retake-len").value;
     try { await runJob("/api/ninja/retake", len > 0 ? { duration_sec: len } : {}, "Retake"); }
     catch (e) { toast(e.message, true); }
+  });
+
+  $n("#nj-finish")?.addEventListener("click", async () => {
+    if (!confirm("Stitch all approved parts + song into one final MP4?")) return;
+    try {
+      await runJob("/api/ninja/finish", { copy_to: "D:\\\\parts\\\\full.mp4" }, "Finish song");
+      toast("Full song ready (exports + D:\\\\parts\\\\full.mp4)");
+    } catch (e) { toast(e.message, true); }
   });
 
   $n("#nj-continue").addEventListener("click", async () => {
@@ -271,7 +380,9 @@
   $n("#nj-reset").addEventListener("click", async () => {
     if (!confirm("Reset project? Finished part files stay on disk.")) return;
     await apiJSON("/api/ninja/reset", { method: "POST" });
-    refreshState();
+    promptsHydrated = false;  // re-fill composer from last_prompts
+    await refreshState();
+    hydrateComposerPrompts(true);
   });
 
   /* ---------- retake tab (clip window patching) ---------- */
@@ -379,39 +490,94 @@
     refreshState();
   });
 
-  /* ---------- upscaler tab ---------- */
+  /* ---------- upscaler tab (multi-video queue) ---------- */
+  const upQueue = []; // { asset, name, file? }
+
+  function renderUpQueue() {
+    const box = $n("#nj-up-queue");
+    if (!upQueue.length) {
+      box.textContent = "Queue empty.";
+      box.className = "nj-muted";
+      return;
+    }
+    box.className = "";
+    box.innerHTML = upQueue.map((it, i) =>
+      `<div class="nj-row" data-qi="${i}">
+        <span>${i + 1}. ${it.name}</span>
+        <label class="btn-small nj-file-btn" title="Optional first-chunk anchor image">🖼 anchor
+          <input type="file" accept="image/*" hidden data-anchor="${i}"></label>
+        <span class="nj-muted" data-anchor-label="${i}">${it.anchorName ? "✓ " + it.anchorName : ""}</span>
+        <button type="button" class="btn-small" data-rm="${i}">✕</button>
+      </div>`).join("");
+    box.querySelectorAll("[data-rm]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        upQueue.splice(+btn.dataset.rm, 1);
+        renderUpQueue();
+      });
+    });
+    box.querySelectorAll("input[data-anchor]").forEach(inp => {
+      inp.addEventListener("change", async () => {
+        const i = +inp.dataset.anchor;
+        if (!inp.files[0]) return;
+        const fd = new FormData();
+        fd.append("file", inp.files[0]);
+        try {
+          const a = await apiJSON("/api/upload", { method: "POST", body: fd });
+          upQueue[i].anchor_asset = a.id;
+          upQueue[i].anchorName = inp.files[0].name;
+          renderUpQueue();
+        } catch (e) { toast(e.message, true); }
+      });
+    });
+  }
+
+  $n("#nj-up-file").addEventListener("change", async () => {
+    const files = [...($n("#nj-up-file").files || [])];
+    $n("#nj-up-file").value = "";
+    if (!files.length) return;
+    for (const file of files) {
+      const fd = new FormData();
+      fd.append("file", file);
+      try {
+        const asset = await apiJSON("/api/upload", { method: "POST", body: fd });
+        upQueue.push({ asset: asset.id, name: file.name });
+      } catch (e) {
+        toast(`${file.name}: ${e.message}`, true);
+      }
+    }
+    renderUpQueue();
+    toast(`Queue: ${upQueue.length} video(s)`);
+  });
+
+  $n("#nj-up-clear").addEventListener("click", () => {
+    upQueue.length = 0;
+    renderUpQueue();
+    $n("#nj-up-results").innerHTML = "";
+  });
+
   $n("#nj-up-run").addEventListener("click", async () => {
-    const fileInput = $n("#nj-up-file");
-    if (!fileInput.files[0]) return toast("Choose a video", true);
-    const fd = new FormData();
-    fd.append("file", fileInput.files[0]);
-    let asset;
-    try { asset = await apiJSON("/api/upload", { method: "POST", body: fd }); }
-    catch (e) { return toast(e.message, true); }
+    if (!upQueue.length) return toast("Add at least one video to the queue", true);
     const body = {
-      asset: asset.id,
       chunk_seconds: +$n("#nj-up-chunk").value,
       denoise: +$n("#nj-up-den").value,
       multiplier: +$n("#nj-up-mult").value,
+      grok_anchor: $n("#nj-up-grok").checked,
+      items: upQueue.map(it => ({
+        asset: it.asset,
+        name: it.name,
+        ...(it.anchor_asset ? { anchor_asset: it.anchor_asset } : {}),
+      })),
     };
-    const anchorInput = $n("#nj-up-anchor");
-    if (anchorInput.files[0]) {
-      const fd2 = new FormData();
-      fd2.append("file", anchorInput.files[0]);
-      const a2 = await apiJSON("/api/upload", { method: "POST", body: fd2 });
-      body.anchor_asset = a2.id;
-    }
     try {
-      const done = await runJob("/api/ninja/upscale", body, "Upscale");
+      const done = await runJob("/api/ninja/upscale_queue", body, "Upscale queue");
       const box = $n("#nj-up-results");
       box.innerHTML = "";
       for (const o of (done && done.outputs) || []) {
         if (o.kind !== "video") continue;
         box.insertAdjacentHTML("beforeend",
-          `<div class="nj-row"><video src="${o.url}" controls style="width:100%;max-height:420px"></video></div>
+          `<div class="nj-row"><video src="${o.url}" controls style="width:100%;max-height:320px"></video></div>
            <div class="nj-row"><a class="btn-small" href="${o.url}" download="${o.name}">⬇ ${o.name}</a></div>`);
       }
-    }
-    catch (e) { toast(e.message, true); }
+    } catch (e) { toast(e.message, true); }
   });
 })();
