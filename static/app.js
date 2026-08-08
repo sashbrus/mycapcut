@@ -1261,6 +1261,12 @@ const TOOL_DEFS = [
     fields: [{ name: "format", type: "radio", label: "Format", options: [["mp3", "MP3"], ["wav", "WAV"], ["original", "Original (lossless)"]], value: "mp3" }],
   },
   {
+    id: "mute", icon: "🔇", title: "Remove audio",
+    desc: "Strip the sound out of a video — pure video, no re-encode, no quality loss.",
+    files: [{ name: "file", label: "Video", accept: "video/*" }],
+    fields: [{ name: "mode", type: "radio", label: "Audio track", options: [["remove", "Remove it completely"], ["silence", "Keep a silent track"]], value: "remove" }],
+  },
+  {
     id: "grab_frame", icon: "📸", title: "Grab a frame",
     desc: "PNG of one video frame. Pick Last/First/Middle, OR At time, OR At frame number — not both.",
     files: [{ name: "file", label: "Video", accept: "video/*" }],

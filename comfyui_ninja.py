@@ -2,7 +2,8 @@
 
 Drives ComfyUI (local or remote) over its HTTP API only:
   - Director: chunk-by-chunk generation with chained 5s upscaled tails.
-  - Upscaler: chained IC-upscale of any video (anchor = prev chunk's last frame).
+  - Upscaler: Pixel Spatial IC-LoRA ×2 (LoadVideo → ManualSigmas → SaveVideo).
+    Chunks are pad/trim joined to the source frame count + original audio.
 
 Templates are frozen snapshots of successful runs captured from /history —
 per host, per kind ("director" / "upscaler"). The builder only overrides
@@ -48,11 +49,11 @@ DEFAULT_CFG = {
     },
     "settings": {
         "tail_seconds": 5.0,
-        # workflow defaults — the user's proven manual values. NOTE: multiplier 1.3
-        # rounds 768x512 to 960x640 (clean 1.5 ratio); 1.1 rounds to 832x512 and
-        # DISTORTS — do not lower without checking the ratio survives rounding.
+        # Legacy VHS upscaler knobs (ignored by Pixel Spatial template).
         "tail_upscale_denoise": 1.0,
         "tail_upscale_multiplier": 1.3,
+        # Pixel Spatial: short-edge resize before the fixed ×2 latent upscale.
+        "upscale_shorter_size": 416,
         "frame_rate": 24,
         "width": 0,
         "height": 0,
@@ -64,11 +65,18 @@ DEFAULT_CFG = {
 }
 
 # node classes that identify a template kind
-KIND_MARKERS = {"director": "LTXDirector", "upscaler": "RTXVideoSuperResolution"}
+KIND_MARKERS = {"director": "LTXDirector",
+                "upscaler": "LTXICLoRALoaderModelOnly",
+                "h3": "MiniMaxH3ImageToVideo",
+                "h3ref": "MiniMaxH3ReferenceToVideo"}
 
-# upscaler template node ids (from the proven "Ltx 2.3 IC Upscale" workflow)
-UP_VIDEO, UP_IMAGE, UP_BYPASS, UP_SCHED, UP_MULT = "5070", "2004", "5019", "5074", "5093"
-UP_SAVE = "5071"
+# Pixel Spatial IC-LoRA upscaler (H100 / LoadVideo + ManualSigmas + SaveVideo)
+UP_VIDEO = "5001"      # LoadVideo → inputs.file
+UP_SHORTER = "5026"    # ResizeImageMaskNode → resize_type.shorter_size
+UP_PROMPT = "2483"     # CLIPTextEncode (positive)
+UP_SAVE = "4852"       # SaveVideo
+# Legacy VHS / RTX template ids (only used if those nodes still exist)
+UP_IMAGE, UP_BYPASS, UP_SCHED, UP_MULT = "2004", "5019", "5074", "5093"
 
 # Grok refine for IC-upscale anchors — same API as grokmcp `edit_image`
 # (docker container vigilant_gould). No invented n8n webhooks.
@@ -129,10 +137,16 @@ def cfg() -> dict:
 
 
 def host_url(role: str) -> str:
+    hosts = cfg()["hosts"]
+    # h3ref runs on the h3 host; h3 rides the director host unless configured
+    if role == "h3ref":
+        role = "h3"
+    if role == "h3" and not (hosts.get("h3") or {}).get("url"):
+        role = "director"
     try:
-        return cfg()["hosts"][role]["url"].rstrip("/")
+        return hosts[role]["url"].rstrip("/")
     except KeyError:
-        raise HTTPException(400, f"unknown host role '{role}' (use director/upscaler)")
+        raise HTTPException(400, f"unknown host role '{role}' (use director/upscaler/h3)")
 
 
 def active_session_file() -> Path:
@@ -1117,24 +1131,448 @@ def build_director_graph(host: str, *, prompts: list, from_sec: float, to_sec: f
     return graph
 
 
+def upscale_template_is_pixel(graph: dict | None = None) -> bool:
+    """True for the Pixel Spatial IC-LoRA template (LoadVideo, no VHS skip)."""
+    g = graph if graph is not None else load_template("upscaler")
+    return any(n.get("class_type") == "LTXICLoRALoaderModelOnly" for n in g.values())
+
+
 def build_upscale_graph(host: str, *, video_file: str, anchor_file: str | None,
                         denoise: float | None, multiplier: float | None,
-                        part_name: str, skip_first_frames: int = 0) -> dict:
+                        part_name: str, skip_first_frames: int = 0,
+                        shorter_size: int | None = None,
+                        prompt: str | None = None) -> dict:
     graph = copy.deepcopy(load_template("upscaler"))
-    graph[UP_VIDEO]["inputs"]["video"] = video_file
-    graph[UP_VIDEO]["inputs"]["frame_load_cap"] = 0
-    # parts after the first: skip_first_frames=1 ("shift 1") — overlap frame is
-    # only for IC continuity; output must NOT drop seam frames on join
-    graph[UP_VIDEO]["inputs"]["skip_first_frames"] = int(skip_first_frames)
-    graph[UP_BYPASS]["inputs"]["value"] = anchor_file is None
-    if anchor_file:
+    vin = graph[UP_VIDEO]["inputs"]
+    if "file" in vin or graph[UP_VIDEO].get("class_type") == "LoadVideo":
+        # Pixel Spatial / core LoadVideo — no skip_first_frames; caller must
+        # pre-trim overlap frames before upload when needed.
+        vin["file"] = video_file
+    else:
+        # Legacy VHS_LoadVideo path
+        vin["video"] = video_file
+        vin["frame_load_cap"] = 0
+        vin["skip_first_frames"] = int(skip_first_frames)
+
+    ss = shorter_size
+    if ss is None and multiplier is not None:
+        try:
+            m = float(multiplier)
+            if m >= 64:  # treat as short-edge pixels (UI "Short edge")
+                ss = int(m)
+        except (TypeError, ValueError):
+            pass
+    if ss is None:
+        try:
+            ss = int((cfg().get("settings") or {}).get("upscale_shorter_size") or 0) or None
+        except (TypeError, ValueError):
+            ss = None
+    if ss is not None and UP_SHORTER in graph:
+        graph[UP_SHORTER]["inputs"]["resize_type.shorter_size"] = int(ss)
+
+    if prompt is not None and UP_PROMPT in graph:
+        graph[UP_PROMPT]["inputs"]["text"] = prompt
+
+    # Legacy RTX / VHS nodes — no-op on Pixel Spatial template
+    if UP_BYPASS in graph:
+        graph[UP_BYPASS]["inputs"]["value"] = anchor_file is None
+    if anchor_file and UP_IMAGE in graph:
         graph[UP_IMAGE]["inputs"]["image"] = anchor_file
-    if denoise is not None:
+    if denoise is not None and UP_SCHED in graph:
         graph[UP_SCHED]["inputs"]["denoise"] = denoise
-    if multiplier is not None:
+    if (multiplier is not None and UP_MULT in graph
+            and (shorter_size is None)
+            and not (isinstance(multiplier, (int, float)) and float(multiplier) >= 64)):
         graph[UP_MULT]["inputs"]["resize_type.multiplier"] = multiplier
+
     set_filename_prefix(graph, f"ninja/{part_name}_up")
     return graph
+
+
+# ---------------------------------------------------------------- minimax h3
+
+H3_I2V_NODE = "MiniMaxH3ImageToVideo"
+H3_FPS = 24
+
+
+def h3_dir() -> Path:
+    d = NINJA_DIR / "h3"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _h3_frames(duration_sec: float) -> int:
+    """Seconds → valid H3 frame length: 24fps snapped up to the 17k+5 grid
+    (same expression as the workflow's Math node)."""
+    f = max(5, round(float(duration_sec) * H3_FPS))
+    return f + (5 - f % 17) % 17
+
+
+def _snap_h3_dim(v: int) -> int:
+    """H3 canvas sizes are multiples of 32."""
+    return max(32, int(round(v / 32) * 32))
+
+
+def _h3_size_from_image(path: Path) -> tuple[int, int]:
+    """Native H3 canvas from the start image: 768 short edge, long edge ≤1344."""
+    try:
+        info = DEPS["ffprobe"](path)
+        st = next((s for s in info.get("streams", []) if s.get("width")), {})
+        w, h = int(st.get("width") or 0), int(st.get("height") or 0)
+    except Exception:
+        w = h = 0
+    if w <= 0 or h <= 0:
+        return 768, 1344
+    if w >= h:
+        return min(1344, round(768 * w / h)), 768
+    return 768, min(1344, round(768 * h / w))
+
+
+def _h3_find_upstream(graph: dict, ref, class_type: str, max_hops: int = 6) -> str | None:
+    """Follow a ["node_id", slot] link upstream to the first node of class_type."""
+    for _ in range(max_hops):
+        if not (isinstance(ref, list) and len(ref) == 2):
+            return None
+        node = graph.get(str(ref[0]))
+        if not node:
+            return None
+        if node.get("class_type") == class_type:
+            return str(ref[0])
+        ins = node.get("inputs") or {}
+        ref = next((v for v in ins.values()
+                    if isinstance(v, list) and len(v) == 2), None)
+    return None
+
+
+def build_h3_i2v_graph(*, prompt: str, image_file: str, width: int, height: int,
+                       duration_sec: float, seed: int | None, part_name: str) -> dict:
+    graph = copy.deepcopy(load_template("h3"))
+    nid = next((k for k, n in graph.items()
+                if n.get("class_type") == H3_I2V_NODE), None)
+    if not nid:
+        raise DEPS["ToolError"](
+            "Captured 'h3' template has no MiniMaxH3ImageToVideo node — "
+            "run the H3 i2v workflow once on the h3 host, then Capture h3.")
+    ins = graph[nid]["inputs"]
+    ins["prompt"] = prompt
+    # literals override ResolutionSelector / Math node links from the template
+    ins["width"] = int(width)
+    ins["height"] = int(height)
+    ins["length"] = _h3_frames(duration_sec)
+    load_nid = _h3_find_upstream(graph, ins.get("first_frame"), "LoadImage")
+    if not load_nid:
+        raise DEPS["ToolError"](
+            "h3 template has no LoadImage feeding first_frame — run the i2v "
+            "workflow once WITH a start image connected, then re-capture h3.")
+    graph[load_nid]["inputs"]["image"] = image_file
+    randomize_seeds(graph)
+    if seed is not None:
+        for node in graph.values():
+            if node.get("class_type") == "RandomNoise":
+                node["inputs"]["noise_seed"] = int(seed)
+    set_filename_prefix(graph, f"ninja/{part_name}")
+    return graph
+
+
+def job_h3_generate(job, host: str, req: dict):
+    """One MiniMax H3 i2v shot: upload start image -> queue -> download video."""
+    prompt = str(req.get("prompt") or "").strip()
+    dur = max(1.0, min(15.0, float(req.get("duration_sec") or 5.0)))
+    a = Path(DEPS["asset_path"](req["image_asset"]))
+    width = int(req.get("width") or 0)
+    height = int(req.get("height") or 0)
+    if not (width and height):
+        width, height = _h3_size_from_image(a)
+    width, height = _snap_h3_dim(width), _snap_h3_dim(height)
+    frames = _h3_frames(dur)
+    part_name = f"h3_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    # center-crop + scale the start image to the exact canvas — H3 squeezes
+    # mismatched aspect ratios instead of cropping, breaking proportions
+    fitted = h3_dir() / f"{part_name}_start.png"
+    ffmpeg(job, [
+        "-i", str(a),
+        "-vf", f"crop=w='min(iw,ih*{width}/{height})':h='min(ih,iw*{height}/{width})',"
+               f"scale={width}:{height}",
+        "-frames:v", "1", str(fitted),
+    ], "fitting start image to canvas")
+    job["message"] = "uploading start image"
+    image_file = comfy_upload(host, fitted, fitted.name)
+    seed = req.get("seed")
+    graph = build_h3_i2v_graph(
+        prompt=prompt, image_file=image_file, width=width, height=height,
+        duration_sec=dur, seed=int(seed) if seed is not None else None,
+        part_name=part_name)
+    job["progress"] = 0.15
+    run = queue_and_wait(host, graph, job, part_name)
+    job["progress"] = 0.9
+    fn, sub = first_video_output(run)
+    dest = h3_dir() / f"{part_name}.mp4"
+    comfy_download(host, fn, sub, dest)
+    result = {"ok": True, "name": part_name, "video": str(dest),
+              "video_url": file_url(dest), "width": width, "height": height,
+              "frames": frames, "duration_sec": round(frames / H3_FPS, 3)}
+    job["result"] = result
+    job["message"] = f"h3 done: {dest.name}"
+    return [result]
+
+
+H3_REF_NODE = "MiniMaxH3ReferenceToVideo"
+H3_REF_PREFIXES = ("ref_images.", "ref_videos.", "ref_video_audios.", "ref_audios.")
+
+
+def _prune_unreachable(graph: dict):
+    """Drop nodes that no longer feed any Save* node (orphaned ref loaders
+    would still be validated by ComfyUI and fail on missing files)."""
+    sinks = [k for k, n in graph.items() if "Save" in (n.get("class_type") or "")]
+    if not sinks:
+        return
+    keep: set[str] = set()
+    stack = list(sinks)
+    while stack:
+        nid = stack.pop()
+        if nid in keep:
+            continue
+        keep.add(nid)
+        for v in (graph[nid].get("inputs") or {}).values():
+            if isinstance(v, list) and len(v) == 2 and str(v[0]) in graph:
+                stack.append(str(v[0]))
+    for k in list(graph):
+        if k not in keep:
+            del graph[k]
+
+
+def build_h3_ref_graph(*, prompt: str, image_files: list[str], audio_files: list[str],
+                       width: int, height: int, duration_sec: float,
+                       seed: int | None, ref_image_size: str | None,
+                       part_name: str) -> dict:
+    """Rewire the captured ref2va template: strip whatever refs it was captured
+    with, inject one loader per requested reference (prompt tags follow the
+    injection order: <Picture N> / <Audio N>)."""
+    graph = copy.deepcopy(load_template("h3ref"))
+    nid = next((k for k, n in graph.items()
+                if n.get("class_type") == H3_REF_NODE), None)
+    if not nid:
+        raise DEPS["ToolError"](
+            "Captured 'h3ref' template has no MiniMaxH3ReferenceToVideo node — "
+            "run the H3 ref workflow once on the h3 host, then Capture h3ref.")
+    ins = graph[nid]["inputs"]
+    for k in [k for k in ins if k.startswith(H3_REF_PREFIXES)]:
+        ins.pop(k)
+    _prune_unreachable(graph)
+    ins["prompt"] = prompt
+    ins["width"] = int(width)
+    ins["height"] = int(height)
+    ins["length"] = _h3_frames(duration_sec)
+    if ref_image_size in ("match", "max"):
+        ins["ref_image_size"] = ref_image_size
+    for i, f in enumerate(image_files[:9]):
+        gid = f"cc_ref_img{i}"
+        graph[gid] = {"class_type": "LoadImage", "inputs": {"image": f}}
+        ins[f"ref_images.ref_image_{i}"] = [gid, 0]
+    for i, f in enumerate(audio_files[:3]):
+        gid = f"cc_ref_aud{i}"
+        graph[gid] = {"class_type": "LoadAudio", "inputs": {"audio": f}}
+        ins[f"ref_audios.ref_audio_{i}"] = [gid, 0]
+    randomize_seeds(graph)
+    if seed is not None:
+        for node in graph.values():
+            if node.get("class_type") == "RandomNoise":
+                node["inputs"]["noise_seed"] = int(seed)
+    set_filename_prefix(graph, f"ninja/{part_name}")
+    return graph
+
+
+def job_h3_ref_generate(job, host: str, req: dict):
+    """One H3 ref2va shot: upload image/audio refs (audio cropped to the
+    requested range) -> queue -> download video."""
+    prompt = str(req.get("prompt") or "").strip()
+    dur = max(1.0, min(15.0, float(req.get("duration_sec") or 5.0)))
+    width = _snap_h3_dim(int(req.get("width") or 768))
+    height = _snap_h3_dim(int(req.get("height") or 1344))
+    part_name = f"h3ref_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    image_files: list[str] = []
+    for i, aid in enumerate(list(req.get("image_assets") or [])[:9]):
+        a = Path(DEPS["asset_path"](aid))
+        job["message"] = f"uploading ref image {i + 1}"
+        image_files.append(comfy_upload(host, a, a.name))
+    audio_files: list[str] = []
+    for i, spec in enumerate(list(req.get("audio_assets") or [])[:3]):
+        if isinstance(spec, str):
+            spec = {"asset": spec}
+        a = Path(DEPS["asset_path"](spec["asset"]))
+        f0 = spec.get("from_sec")
+        t0 = spec.get("to_sec")
+        if f0 is not None and t0 is not None and float(t0) > float(f0):
+            cut = h3_dir() / f"{part_name}_aud{i}.wav"
+            ffmpeg(job, ["-i", str(a), "-ss", f"{float(f0):.3f}",
+                         "-to", f"{float(t0):.3f}", "-ar", "44100", "-ac", "2",
+                         str(cut)], f"cropping ref audio {i + 1}")
+            a = cut
+        job["message"] = f"uploading ref audio {i + 1}"
+        audio_files.append(comfy_upload(host, a, a.name))
+    seed = req.get("seed")
+    graph = build_h3_ref_graph(
+        prompt=prompt, image_files=image_files, audio_files=audio_files,
+        width=width, height=height, duration_sec=dur,
+        seed=int(seed) if seed is not None else None,
+        ref_image_size=req.get("ref_image_size"), part_name=part_name)
+    job["progress"] = 0.15
+    run = queue_and_wait(host, graph, job, part_name)
+    job["progress"] = 0.9
+    fn, sub = first_video_output(run)
+    dest = h3_dir() / f"{part_name}.mp4"
+    comfy_download(host, fn, sub, dest)
+    frames = _h3_frames(dur)
+    result = {"ok": True, "name": part_name, "video": str(dest),
+              "video_url": file_url(dest), "width": width, "height": height,
+              "frames": frames, "duration_sec": round(frames / H3_FPS, 3),
+              "refs": {"images": len(image_files), "audios": len(audio_files)}}
+    job["result"] = result
+    job["message"] = f"h3ref done: {dest.name}"
+    return [result]
+
+
+def job_h3_chunk(job, host: str, p: dict, req: dict):
+    """One Director part generated by MiniMax H3 ref2va.
+
+    Assistant work is automatic: song slice for the part window -> <Audio 1>,
+    last frame of the previous part -> <Picture 1> (when start=last_frame),
+    resolution locked to the project grid, duration = window length.
+    Lands as a normal review chunk — Commit / Retake / Finish unchanged."""
+    from_sec, to_sec = float(req["from_sec"]), float(req["to_sec"])
+    song = p.get("song") or {}
+    song_dur = float(song.get("duration") or 0.0)
+    if song_dur > 0 and to_sec > song_dur:
+        to_sec = round(song_dur, 3)
+        req = dict(req)
+        req["to_sec"] = to_sec
+    win = to_sec - from_sec
+    if win <= 0.05:
+        raise DEPS["ToolError"](
+            f"Empty window {from_sec:.1f}-{to_sec:.1f}s — already past song end?")
+    if win > 15.2:
+        raise DEPS["ToolError"](f"H3 max part length is 15s (asked {win:.1f}s)")
+    dur = min(15.0, win)
+
+    finals = [c for c in p["chunks"] if c.get("final")]
+    if not p.get("work_resolution") and finals:
+        finfo = DEPS["ffprobe"](Path(p["chunks"][0]["raw"]))
+        fst = next((st for st in finfo.get("streams", [])
+                    if st.get("codec_type") == "video"), {})
+        p["work_resolution"] = {"w": int(fst.get("width", 0)),
+                                "h": int(fst.get("height", 0))}
+        save_project(p)
+    if p.get("work_resolution"):
+        width = _snap_h3_dim(int(p["work_resolution"]["w"]))
+        height = _snap_h3_dim(int(p["work_resolution"]["h"]))
+    else:
+        # first part fixes the project canvas for every later part
+        width = _snap_h3_dim(int(req.get("width") or 768))
+        height = _snap_h3_dim(int(req.get("height") or 1344))
+        p["work_resolution"] = {"w": width, "h": height}
+        save_project(p)
+
+    n = len(finals) + 1
+    part_name = f"part{n}-{int(from_sec)}-{int(to_sec)}"
+    work = session_work_dir(p)
+
+    # <Picture 1>: last frame of the previous part, cropped to the canvas
+    image_files: list[str] = []
+    if req.get("start") == "last_frame":
+        if not finals:
+            raise DEPS["ToolError"](
+                "No previous part yet — use start=none for the first part")
+        prev = Path(finals[-1].get("final") or finals[-1].get("raw"))
+        # lossless extract, NO crop/scale/re-fit — the last frame IS the
+        # continuation anchor and must reach H3 byte-identical in content
+        last_png = work / f"{part_name}_h3_last.png"
+        ffmpeg(job, ["-sseof", "-0.05", "-i", str(prev), "-frames:v", "1",
+                     "-update", "1", str(last_png)], "extracting last frame")
+        image_files.append(comfy_upload(host, last_png, last_png.name))
+    for i, aid in enumerate(list(req.get("image_assets") or [])[:8]):
+        a = Path(DEPS["asset_path"](aid))
+        job["message"] = f"uploading ref image {i + 1}"
+        image_files.append(comfy_upload(host, a, a.name))
+
+    # <Audio 1>: the song slice for exactly this window
+    audio_files: list[str] = []
+    if (req.get("audio") or "song") == "song":
+        song_local = Path(song["path"])
+        slice_path = work / f"{part_name}_h3_audio.wav"
+        ffmpeg(job, ["-i", str(song_local), "-ss", f"{from_sec:.6f}",
+                     "-to", f"{to_sec:.6f}", "-ar", "44100", "-ac", "2",
+                     str(slice_path)], "slicing song for window")
+        audio_files.append(comfy_upload(host, slice_path, slice_path.name))
+    job["progress"] = 0.15
+
+    seed = req.get("seed")
+    graph = build_h3_ref_graph(
+        prompt=str(req.get("prompt") or "").strip(),
+        image_files=image_files, audio_files=audio_files,
+        width=width, height=height, duration_sec=dur,
+        seed=int(seed) if seed is not None else None,
+        ref_image_size=req.get("ref_image_size"), part_name=part_name)
+    run = queue_and_wait(host, graph, job, part_name)
+    job["progress"] = 0.9
+    fn, sub = first_video_output(run)
+    raw = work / f"{part_name}_raw.mp4"
+    comfy_download(host, fn, sub, raw)
+
+    chunk = {"id": uuid.uuid4().hex[:8], "part": part_name,
+             "from": from_sec, "to": to_sec,
+             "tail_used": False, "tail_seconds": 0.0,
+             "raw": str(raw), "preview": str(raw), "final": None,
+             "status": "review", "request": {**req, "engine": "h3"},
+             "host": "h3ref"}
+
+    # cumulative PROGRESS preview — same behavior as the LTX flow: committed
+    # parts + this candidate + the ORIGINAL song audio (take-only when the
+    # window does not abut the covered end)
+    job["message"] = "building cumulative preview"
+    try:
+        cscale = f"scale={width}:{height}:flags=lanczos"
+        cvf = ["-vf", cscale, "-pix_fmt", "yuv420p"]
+        cand = work / f"{part_name}_candidate.mp4"
+        ffmpeg(job, ["-i", str(raw), "-t", f"{to_sec - from_sec:.6f}", *cvf,
+                     "-c:v", "libx264", "-crf", "12", "-preset", "fast", "-an",
+                     str(cand)], "trimming candidate")
+        preview = work / f"{part_name}_preview.mp4"
+        covered = max([float(c.get("to") or 0) for c in finals], default=0.0)
+        abutting = abs(from_sec - covered) <= 0.35
+        if finals and abutting:
+            seq = [Path(c["final"]) for c in finals] + [cand]
+            lst = work / f"{part_name}_concat.txt"
+            lst.write_text("".join(f"file '{x}'\n" for x in seq), encoding="utf-8")
+            joined = work / f"{part_name}_joined_v.mp4"
+            DEPS["run"]([DEPS["FFMPEG"], "-y", "-loglevel", "error", "-f", "concat",
+                         "-safe", "0", "-i", str(lst), "-an", "-vf", cscale,
+                         "-pix_fmt", "yuv420p", "-c:v", "libx264", "-crf", "14",
+                         "-preset", "fast", str(joined)])
+            first_from = min(float(c["from"]) for c in finals)
+            DEPS["run"]([DEPS["FFMPEG"], "-y", "-loglevel", "error", "-i", str(joined),
+                         "-ss", f"{first_from:.6f}", "-i", str(Path(p['song']['path'])),
+                         "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+                         "-c:a", "aac", "-b:a", "192k", "-shortest", str(preview)])
+            chunk["preview_kind"] = "cumulative"
+        else:
+            DEPS["run"]([DEPS["FFMPEG"], "-y", "-loglevel", "error", "-i", str(cand),
+                         "-ss", f"{from_sec:.6f}", "-i", str(Path(p['song']['path'])),
+                         "-map", "0:v", "-map", "1:a",
+                         "-t", f"{max(0.1, to_sec - from_sec):.6f}",
+                         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                         "-shortest", str(preview)])
+            chunk["preview_kind"] = "take_only"
+        chunk["preview"] = str(preview)
+    except Exception:
+        chunk["preview"] = str(raw)  # fallback: at least the raw clip
+
+    p["chunks"] = finals + [chunk]
+    p.pop("pending_tail", None)
+    p.pop("final_video", None)
+    p.pop("finished_at", None)
+    save_project(p)
+    job["message"] = f"h3 part ready: {part_name}"
+    return [str(raw)]
 
 
 # ---------------------------------------------------------------- pipeline jobs
@@ -1863,20 +2301,28 @@ def job_standalone_upscale(job, host: str, req: dict):
 
       part1:     [0, step)           skip=0  → feeds `step` frames (8k+1)
       middle:    [prev−1, next)      skip=1  → feeds `step` frames (8k+1)
-                 start frame already upscaled; not re-emitted
+                 overlap trimmed before LoadVideo (or VHS skip_first_frames)
       last part: [prev−1, n_src)     skip=1  → to end; input padded to 8k+1
                  for Comfy, output trimmed back to exact leftover frames
       join:      total == n_src + original audio
     """
     src = Path(DEPS["asset_path"](req["asset"]))
-    chunk_len = float(req.get("chunk_seconds", 10))
+    chunk_len = float(req.get("chunk_seconds", 15))
     denoise = req.get("denoise")
     mult = req.get("multiplier")
+    shorter_size = req.get("shorter_size")
+    if shorter_size is None and mult is not None:
+        try:
+            if float(mult) >= 64:
+                shorter_size = int(float(mult))
+        except (TypeError, ValueError):
+            pass
     grok_anchor = bool(req.get("grok_anchor", False))
     grok_prompt = req.get("grok_prompt") or DEFAULT_GROK_UPSCALE_PROMPT
     q_lo = float(req.get("_q_lo", 0.0))
     q_hi = float(req.get("_q_hi", 1.0))
     q_label = req.get("_q_label") or ""
+    pixel_up = upscale_template_is_pixel()
 
     def _prog(local: float, msg: str):
         job["message"] = f"{q_label} {msg}".strip() if q_label else msg
@@ -1893,26 +2339,30 @@ def job_standalone_upscale(job, host: str, req: dict):
     # 10s @24fps → 240 → nearest LTX legal 241 (8*30+1)
     raw_step = max(9, int(round(chunk_len * fps)))
     step = _ltx_nearest(raw_step)
-    _prog(0.0, f"chunk {chunk_len:g}s → {raw_step}f → LTX {step}f ({step / fps:.3f}s)")
+    _prog(0.0, f"chunk {chunk_len:g}s → {raw_step}f → LTX {step}f ({step / fps:.3f}s)"
+                f"{' [pixel IC]' if pixel_up else ''}")
     # nominal chunk ends on the LTX grid; last cut always n_src
     nominal = list(range(step, n_src, step))
     cuts = nominal + [n_src]
 
-    # first anchor: explicit asset, or the clip's own first frame (+ optional Grok)
-    if req.get("anchor_asset"):
-        a0 = Path(DEPS["asset_path"](req["anchor_asset"]))
-        if grok_anchor:
-            refined = work / "anchor_000_grok.png"
-            a0 = refine_anchor_image(a0, refined, job, prompt=grok_prompt)
-        anchor_remote = comfy_upload(host, a0, a0.name)
-    else:
-        a0 = work / "anchor_000.png"
-        ffmpeg(job, ["-i", str(src), "-vf", "select='eq(n\\,0)'", "-vsync", "0",
-                     "-frames:v", "1", str(a0)], "extracting first-frame anchor")
-        if grok_anchor:
-            refined = work / "anchor_000_grok.png"
-            a0 = refine_anchor_image(a0, refined, job, prompt=grok_prompt)
-        anchor_remote = comfy_upload(host, a0, a0.name)
+    # Legacy VHS template used a still image as IC anchor. Pixel Spatial guides
+    # from the input video frames themselves — skip anchor extract/upload.
+    anchor_remote = None
+    if not pixel_up:
+        if req.get("anchor_asset"):
+            a0 = Path(DEPS["asset_path"](req["anchor_asset"]))
+            if grok_anchor:
+                refined = work / "anchor_000_grok.png"
+                a0 = refine_anchor_image(a0, refined, job, prompt=grok_prompt)
+            anchor_remote = comfy_upload(host, a0, a0.name)
+        else:
+            a0 = work / "anchor_000.png"
+            ffmpeg(job, ["-i", str(src), "-vf", "select='eq(n\\,0)'", "-vsync", "0",
+                         "-frames:v", "1", str(a0)], "extracting first-frame anchor")
+            if grok_anchor:
+                refined = work / "anchor_000_grok.png"
+                a0 = refine_anchor_image(a0, refined, job, prompt=grok_prompt)
+            anchor_remote = comfy_upload(host, a0, a0.name)
 
     pieces = []
     prev_end = 0
@@ -1945,7 +2395,7 @@ def job_standalone_upscale(job, host: str, req: dict):
             raise DEPS["ToolError"](
                 f"part {i + 1}: cut produced {cut_n} frames, expected {cut_frames}")
 
-        # Frames VHS loads after skip must be 8k+1 or LTX will snap (e.g. 240→233).
+        # Frames fed to Comfy must be 8k+1 or LTX will snap (e.g. 240→233).
         load_n = cut_frames - skip
         comfy_n = _ltx_ceil(load_n)
         upload = c
@@ -1963,12 +2413,27 @@ def job_standalone_upscale(job, host: str, req: dict):
                          str(c_ltx)], f"LTX-pad part {i + 1}")
             upload = c_ltx
 
+        # LoadVideo has no skip_first_frames — drop overlap before upload.
+        graph_skip = skip
+        if pixel_up and skip > 0:
+            c_feed = work / f"c{i:03d}_feed.mp4"
+            _prog((i + 0.2) / max(1, n_parts),
+                  f"part {i + 1}: trim skip={skip} for LoadVideo")
+            ffmpeg(job, ["-i", str(upload),
+                         "-vf", (f"trim=start_frame={skip},"
+                                 f"setpts=PTS-STARTPTS,fps={fps}"),
+                         "-an", "-c:v", "libx264", "-crf", "12", "-preset", "fast",
+                         str(c_feed)], f"trim skip part {i + 1}")
+            upload = c_feed
+            graph_skip = 0
+
         remote_v = comfy_upload(host, upload, upload.name)
         graph = build_upscale_graph(
             host, video_file=remote_v, anchor_file=anchor_remote,
             denoise=denoise, multiplier=mult,
             part_name=f"upsc_{src.stem}_{i:03d}",
-            skip_first_frames=skip,
+            skip_first_frames=graph_skip,
+            shorter_size=int(shorter_size) if shorter_size is not None else None,
         )
         run = queue_and_wait(host, graph, job, f"part {i + 1}/{n_parts}")
         fn, sub = first_video_output(run)
@@ -2006,8 +2471,8 @@ def job_standalone_upscale(job, host: str, req: dict):
         pieces.append(piece)
         prev_end = b
 
-        # next anchor = last frame of THIS upscaled part → optional Grok refine
-        if not is_last:
+        # next anchor = last frame of THIS upscaled part (legacy VHS template only)
+        if not is_last and not pixel_up:
             anchor_png = work / f"anchor_{i + 1:03d}.png"
             ffmpeg(job, ["-i", str(piece),
                          "-vf", f"select='eq(n\\,{exp_out - 1})'", "-vsync", "0",
@@ -2052,7 +2517,7 @@ def job_upscale_queue(job, host: str, req: dict):
 
     req = {
       items: [{ asset, name?, anchor_asset? }, ...],
-      chunk_seconds, denoise, multiplier, grok_anchor, grok_prompt?
+      chunk_seconds, shorter_size, denoise, multiplier, grok_anchor, grok_prompt?
     }
     On item failure: record error and continue with the next video (unless
     stop_on_error=true).
@@ -2062,9 +2527,10 @@ def job_upscale_queue(job, host: str, req: dict):
         raise DEPS["ToolError"]("Upscale queue is empty")
     stop_on_error = bool(req.get("stop_on_error", False))
     shared = {
-        "chunk_seconds": req.get("chunk_seconds", 10),
+        "chunk_seconds": req.get("chunk_seconds", 15),
         "denoise": req.get("denoise"),
         "multiplier": req.get("multiplier"),
+        "shorter_size": req.get("shorter_size"),
         "grok_anchor": bool(req.get("grok_anchor", False)),
     }
     if req.get("grok_prompt"):
@@ -2435,13 +2901,23 @@ def register(app, deps: dict):
         if not p["chunks"] or p["chunks"][-1].get("final"):
             raise HTTPException(400, "Nothing to retake — generate first")
         chunk = p["chunks"][-1]
-        load_template("director")
         # retake = same request, NEW seed; optional duration / prompt overrides
         req = req or {}
         new_req = dict(chunk["request"])
         dur = req.get("duration_sec")
         if dur:
             new_req["to_sec"] = round(float(new_req["from_sec"]) + float(dur), 3)
+        if new_req.get("engine") == "h3":
+            # H3 part: single prompt — take the scene prompt override if given
+            load_template("h3ref")
+            if req.get("prompts"):
+                txt = (req["prompts"][0] or {}).get("text")
+                if txt:
+                    new_req["prompt"] = txt
+            new_req.pop("seed", None)  # always reroll on retake
+            job = start_ninja_job("ninja-retake", job_h3_chunk, "h3ref", p, new_req)
+            return _job_response(job)
+        load_template("director")
         if "global_prompt" in req:
             new_req["global_prompt"] = req.get("global_prompt") or ""
         if req.get("prompts"):
@@ -2685,6 +3161,119 @@ def register(app, deps: dict):
         if status:
             jobs = [j for j in jobs if j.get("status") == status]
         return {"ok": True, "jobs": jobs[:40], "count": len(jobs)}
+
+    # ---------------- MiniMax H3 (i2v smoke) ----------------
+
+    @app.get("/api/h3/status")
+    def h3_status():
+        return {"ok": True, "host": host_url("h3"),
+                "template": tpl_path("h3").is_file(),
+                "template_ref": tpl_path("h3ref").is_file(),
+                "capture_url": "/api/ninja/capture/h3"}
+
+    @app.post("/api/h3/generate")
+    async def h3_generate(req: dict):
+        req = req or {}
+        if not str(req.get("prompt") or "").strip():
+            raise HTTPException(400, "prompt required")
+        if not req.get("image_asset"):
+            raise HTTPException(
+                400, "image_asset required (i2v smoke — upload the start "
+                     "image via /api/upload first)")
+        load_template("h3")  # fail fast with the capture hint
+        job = DEPS["start_job"]("h3-generate", job_h3_generate, "h3", req)
+        return {"ok": True, "job": job["id"], "status_url": f"/api/job/{job['id']}"}
+
+    @app.get("/api/director/projects")
+    def director_projects():
+        """Unfinished (and finished) projects across sessions, newest first."""
+        root = NINJA_DIR / "sessions"
+        active = get_active_session_id()
+        items = []
+        dirs = sorted([d for d in root.iterdir() if d.is_dir()],
+                      key=lambda x: x.stat().st_mtime, reverse=True) if root.is_dir() else []
+        for d in dirs:
+            pj = d / "project.json"
+            if not pj.is_file():
+                continue
+            data = _load_json(pj, {})
+            song = data.get("song") or {}
+            if not song:
+                continue
+            finals = [c for c in data.get("chunks") or [] if c.get("final")]
+            covered = max([float(c.get("to") or 0) for c in finals], default=0.0)
+            items.append({
+                "session_id": data.get("session_id") or d.name,
+                "song": data.get("name") or song.get("filename") or "?",
+                "parts": len(finals),
+                "covered": round(covered, 1),
+                "duration": round(float(song.get("duration") or 0), 1),
+                "finished": bool(data.get("final_video")),
+                "active": d.name == active,
+            })
+            if len(items) >= 20:
+                break
+        return {"ok": True, "projects": items}
+
+    @app.post("/api/director/projects/open")
+    async def director_projects_open(req: dict):
+        sid = str((req or {}).get("session_id") or "").strip()
+        d = NINJA_DIR / "sessions" / sid
+        if not (d / "project.json").is_file():
+            raise HTTPException(404, f"project {sid} not found")
+        set_active_session_id(sid)
+        return director_status(project())
+
+    @app.post("/api/director/canvas")
+    async def director_canvas(req: dict):
+        """Lock the project canvas (before the first part is generated)."""
+        w = int((req or {}).get("width") or 0)
+        h = int((req or {}).get("height") or 0)
+        if w <= 0 or h <= 0:
+            raise HTTPException(400, "width/height required")
+        p = project()
+        p["work_resolution"] = {"w": _snap_h3_dim(w), "h": _snap_h3_dim(h)}
+        save_project(p)
+        return {"ok": True, "work_resolution": p["work_resolution"]}
+
+    @app.post("/api/director/h3_generate")
+    async def director_h3_generate(req: dict):
+        """H3-engine Director part: window + prompt (+ optional start=last_frame,
+        extra image_assets, audio="song"|"none"). Lands as a review chunk."""
+        req = req or {}
+        p = project()
+        if not p.get("song"):
+            raise HTTPException(400, "Upload a song first")
+        if not str(req.get("prompt") or "").strip():
+            raise HTTPException(400, "prompt required")
+        if req.get("from_sec") is None or req.get("to_sec") is None:
+            raise HTTPException(400, "from_sec / to_sec required")
+        if p["chunks"] and not p["chunks"][-1].get("final"):
+            raise HTTPException(400, "Commit or Retake the current review first")
+        load_template("h3ref")
+        req["engine"] = "h3"
+        job = start_ninja_job("h3-part", job_h3_chunk, "h3ref", p, req)
+        return _job_response(job)
+
+    @app.post("/api/h3/ref_generate")
+    async def h3_ref_generate(req: dict):
+        req = req or {}
+        if not str(req.get("prompt") or "").strip():
+            raise HTTPException(400, "prompt required")
+        if not (req.get("image_assets") or req.get("audio_assets")):
+            raise HTTPException(
+                400, "at least one reference required (image_assets / "
+                     "audio_assets — upload via /api/upload)")
+        load_template("h3ref")  # fail fast with the capture hint
+        job = DEPS["start_job"]("h3-ref-generate", job_h3_ref_generate, "h3ref", req)
+        return {"ok": True, "job": job["id"], "status_url": f"/api/job/{job['id']}"}
+
+    @app.get("/api/h3/job/{jid}")
+    def h3_job(jid: str):
+        job = DEPS.get("get_job", lambda _jid: None)(jid)
+        if job is None:
+            raise HTTPException(404, "job not found")
+        return job
 
     # ---------------- Retake (clip window patching) ----------------
 

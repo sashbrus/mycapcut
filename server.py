@@ -4,7 +4,8 @@ CupCut Studio — a CapCut-style web video/audio editor.
 Backend: FastAPI + ffmpeg.
   - Asset library (upload, probe, waveform peaks, filmstrip, thumbnails)
   - One-shot Tools (trim/split, join, attach audio, image+audio->mp4,
-    extract audio, frame grab, convert, speed, volume/fade, inspect)
+    extract audio, remove audio, frame grab, convert, speed, volume/fade,
+    inspect)
   - Timeline export: renders the Studio timeline (video track + N audio
     tracks) into a single MP4 via one ffmpeg filter_complex graph.
   - Long operations run as background jobs with real ffmpeg progress.
@@ -897,6 +898,40 @@ def tool_extract_audio(job, fields, files):
     return [output_entry(out, "audio")]
 
 
+def tool_mute(job, fields, files):
+    """Strip the sound out of a video — video stream is copied, never re-encoded."""
+    src = files["file"][0]
+    meta = media_meta(src)
+    if meta["kind"] != "video":
+        raise ToolError("Upload a video file.")
+    if not meta["hasAudio"]:
+        raise ToolError("This video already has no audio track.")
+
+    ext = src.suffix.lower() if src.suffix.lower() in (".mp4", ".mov", ".mkv", ".webm") else ".mp4"
+    out = out_path(ext, "muted")
+    mode = fields.get("mode", "remove")
+
+    if mode == "silence":
+        # keep a silent audio track — some editors/players expect one
+        cmd = [FFMPEG, "-y", "-i", src,
+               "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+               *enc_audio(), "-shortest", "-movflags", "+faststart", out]
+    else:
+        cmd = [FFMPEG, "-y", "-i", src, "-map", "0:v", "-c:v", "copy", "-an",
+               "-movflags", "+faststart", out]
+
+    try:
+        run_ffmpeg_progress(cmd, meta["duration"], job)
+    except ToolError:
+        # container can't hold the source codec as-is -> fall back to a re-encode
+        job["progress"] = 0.0
+        out = out_path(".mp4", "muted")
+        cmd = [FFMPEG, "-y", "-i", src, "-map", "0:v", *enc_video(), "-an", out]
+        run_ffmpeg_progress(cmd, meta["duration"], job)
+    return [output_entry(out, "video")]
+
+
 def tool_grab_frame(job, fields, files):
     src = files["file"][0]
     meta = media_meta(src)
@@ -1092,6 +1127,7 @@ TOOLS = {
     "attach_audio": tool_attach_audio,
     "image_audio": tool_image_audio,
     "extract_audio": tool_extract_audio,
+    "mute": tool_mute,
     "grab_frame": tool_grab_frame,
     "convert": tool_convert,
     "speed": tool_speed,

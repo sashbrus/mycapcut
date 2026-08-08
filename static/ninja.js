@@ -559,9 +559,10 @@
     if (!upQueue.length) return toast("Add at least one video to the queue", true);
     const body = {
       chunk_seconds: +$n("#nj-up-chunk").value,
-      denoise: +$n("#nj-up-den").value,
+      shorter_size: +$n("#nj-up-mult").value,
       multiplier: +$n("#nj-up-mult").value,
-      grok_anchor: $n("#nj-up-grok").checked,
+      denoise: +($n("#nj-up-den")?.value || 1),
+      grok_anchor: !!$n("#nj-up-grok")?.checked,
       items: upQueue.map(it => ({
         asset: it.asset,
         name: it.name,
